@@ -1,3 +1,1 @@
-python-telegram-bot==21.4
-fastapi==0.115.0
-uvicorn==0.30.6
+web: uvicorn webhook:app --host 0.0.0.0 --port $PORT
