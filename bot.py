@@ -1,280 +1,406 @@
-# bot.py
-import os, re, random
-from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Set, Tuple
-from unidecode import unidecode
+# -*- coding: utf-8 -*-
+"""
+Wordgame Bot – phiên bản tích hợp:
+- /newgame: mở sảnh, auto-begin sau 60s nếu không ai gõ /begin
+- /join: tham gia
+- /begin: bắt đầu ngay (nếu muốn)
+- Luật: đúng 2 từ, mỗi từ >= 2 ký tự, đều có trong từ điển (dict_vi.txt).
+- Mỗi lượt 60s; sau 30s nếu người chơi chưa trả lời sẽ nhắc; hết 60s mà chưa trả lời -> LOẠI.
+- Trả lời sai -> LOẠI.
+"""
 
-from telegram import Update
+import asyncio
+import os
+import random
+import re
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Set
+
+from fastapi import FastAPI, Request  # webhook
+from telegram import Update, Message, User
+from telegram.constants import ParseMode
 from telegram.ext import (
     Application, ApplicationBuilder, CommandHandler,
-    MessageHandler, ContextTypes, filters,
+    ContextTypes, MessageHandler, filters
 )
 
-# ================== CẤU HÌNH (ENV) ==================
-TOKEN            = os.getenv("TELEGRAM_TOKEN", "").strip()
-ROUND_SECONDS    = int(os.getenv("ROUND_SECONDS", "60"))     # 60s mỗi lượt
-HALFTIME_SECONDS = int(os.getenv("HALFTIME_SECONDS", "30"))  # nhắc 30s
-AUTO_BEGIN_AFTER = int(os.getenv("AUTO_BEGIN_AFTER", "60"))  # tự bắt đầu sau 60s
-MIN_PLAYERS      = int(os.getenv("MIN_PLAYERS", "1"))        # ≥1 người là bắt đầu
-MIN_WORD_LEN     = int(os.getenv("MIN_WORD_LEN", "2"))       # mỗi từ ≥2 ký tự
-EXACT_WORDS      = 2                                         # bắt buộc đúng 2 từ
+# ====== CẤU HÌNH ======
+TOKEN = os.environ.get("TELEGRAM_TOKEN", "").strip()
+ROUND_SECONDS = int(os.environ.get("ROUND_SECONDS", "60"))   # mặc định 60s
+MIN_WORD_LEN = int(os.environ.get("MIN_WORD_LEN", "2"))      # mỗi từ >=2 ký tự
+AUTO_BEGIN_SECONDS = int(os.environ.get("AUTO_BEGIN_SECONDS", "60"))  # 60s auto-begin
+DICT_PATH = os.environ.get("DICT_PATH", "dict_vi.txt")       # đường dẫn file từ điển
 
-# ================== THÔNG ĐIỆP ==================
+# ====== TỪ/CÂU MẪU ======
 HALF_WARNINGS = [
-    "Còn 30 giây cuối để bạn suy nghĩ về cuộc đời:))",
+    "Còn 30 giây cuối để bạn suy nghĩ về cuộc đời :))",
     "Tắc ẻ đến vậy sao, 30 giây cuối nè :||",
     "30 vẫn chưa phải tết, nhưng mi sắp hết giờ rồi. 30 giây!",
-    "Mắc đ*tt rặn mãi không ra? 30 giây cuối nè!",
-    "30 giây cuối ní ơi!",
+    "Mắc đít rặn mãi không ra… 30 giây cuối nè!",
+    "30 giây cuối ní ơi!"
 ]
-WRONG_REPLIES = [
+
+WRONG_MESSAGES = [
     "IQ bạn cần phải xem xét lại, mời tiếp!!",
     "Mỗi thế cũng sai, GG cũng không cứu được!",
     "Sai rồi má, tra lại từ điển đi!",
     "Từ gì vậy má, học lại lớp 1 đi!!",
-    "Ảo tiếng Việt hee.",
-    "Loại, người tiếp theo!",
-    "Chưa tiến hoá hết à, từ này con người dùng sao? Sai bét!!",
+    "Ảo tiếng Việt hả hee?",
+    "Loại! Người tiếp theo.",
+    "Chưa tiến hoá hết à? Từ này con người dùng sao… Sai bét!!"
 ]
-TIMEOUT_REPLY = "Hết giờ, mời bạn ra ngoài chờ!!"
 
-# ================== TỪ ĐIỂN (CHỈ DÙNG PHRASES.TXT) ==================
-BASE_DIR = os.path.dirname(__file__)
-PHRASES_FP = os.path.join(BASE_DIR, "data", "phrases.txt")   # <-- file bạn tự lưu
+TIMEOUT_MESSAGE = "⏰ Hết giờ, mời bạn ra ngoài chờ!!"
 
-def _read_lines(path: str) -> List[str]:
-    out = []
+RULES_TEXT = (
+    "📘 Luật: đúng 2 từ • mỗi từ ≥2 ký tự • mỗi từ phải có nghĩa (nằm trong từ điển)."
+)
+
+# ====== TỪ ĐIỂN: nạp từ file (mỗi dòng 1 từ, chữ thường) ======
+def load_dictionary(path: str) -> Set[str]:
+    words: Set[str] = set()
     try:
         with open(path, "r", encoding="utf-8") as f:
             for line in f:
-                s = line.strip()
-                if s and not s.startswith("#"):
-                    out.append(s)
+                w = line.strip().lower()
+                if not w:
+                    continue
+                # bỏ dấu chấm phẩy, số… giữ chữ và khoảng trắng trong từ đơn
+                if re.fullmatch(r"[0-9\s\W]+", w):
+                    continue
+                words.add(w)
+        if words:
+            print(f"[DICT] Loaded {len(words)} words from {path}")
+            return words
     except FileNotFoundError:
-        # Nếu thiếu file, để rỗng -> mọi câu đều bị sai (đúng yêu cầu: chỉ nhận cụm có trong từ điển)
         pass
-    return out
 
-def normalize(s: str) -> str:
-    # lower + bỏ dấu + giữ chữ/số/khoảng trắng
-    s = s.lower().replace("đ", "d")
-    s = unidecode(s)
-    s = re.sub(r"[^a-z0-9\s]", " ", s)
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
+    # Fallback seed (ít) để chạy tạm nếu bạn chưa upload dict_vi.txt
+    seed = """
+    xinh xắn
+    hiền hậu
+    mạnh mẽ
+    hoa hồng
+    hoa cúc
+    bánh mì
+    nước mía
+    cà phê
+    bờ biển
+    trường học
+    công viên
+    bầu trời
+    mặt trăng
+    con mèo
+    con chó
+    """.strip().splitlines()
+    for w in seed:
+        words.add(w.strip().lower())
+    print(f"[DICT] Fallback seed used: {len(words)} words")
+    return words
 
-# Tập cụm 2 từ có nghĩa (chuẩn hoá để so khớp nhanh)
-PHRASES: Set[str] = set(normalize(x) for x in _read_lines(PHRASES_FP))
+VN_DICT: Set[str] = load_dictionary(DICT_PATH)
 
-# ================== HÀM VẦN (rhyme) ==================
-_VOWEL_KEY_RE = re.compile(r"[aeiouy]+[a-z]*$")   # lấy cụm nguyên âm + phụ âm cuối
-
-def last_word(text: str) -> str:
-    toks = normalize(text).split()
-    return toks[-1] if toks else ""
-
-def rhyme_key(syllable: str) -> str:
-    base = normalize(syllable)
-    if not base:
-        return ""
-    m = _VOWEL_KEY_RE.search(base)
-    return m.group(0) if m else (base[-2:] if len(base) >= 2 else base)
-
-def same_rhyme(prev_phrase: Optional[str], new_phrase: str) -> bool:
-    if not prev_phrase:
-        return True  # lượt đầu tiên, không cần so vần
-    return rhyme_key(last_word(prev_phrase)) == rhyme_key(last_word(new_phrase))
-
-# ================== KIỂM TRA LUẬT ==================
-def is_two_words(text: str) -> Tuple[bool, List[str]]:
-    toks = normalize(text).split()
-    if len(toks) != EXACT_WORDS:
-        return False, toks
-    if any(len(t) < MIN_WORD_LEN for t in toks):
-        return False, toks
-    return True, toks
-
-def in_dictionary_two_word(text: str) -> bool:
-    """Chỉ chấp nhận nếu cụm 2 từ này có trong data/phrases.txt (đã normalize)."""
-    ok, toks = is_two_words(text)
-    if not ok:
-        return False
-    norm = " ".join(toks)
-    return norm in PHRASES
-
-# ================== TRẠNG THÁI VÁN ==================
+# ====== TRẠNG THÁI VÁN ======
 @dataclass
 class Match:
     chat_id: int
-    lobby: Set[int] = field(default_factory=set)
-    players: List[int] = field(default_factory=list)
-    names: Dict[int, str] = field(default_factory=dict)
+    players: List[int] = field(default_factory=list)   # danh sách id user đã join
+    alive: List[int] = field(default_factory=list)     # id còn sống
     active: bool = False
     turn_idx: int = 0
-    current_phrase: Optional[str] = None
-    halftime_job: Optional[str] = None
-    timeout_job: Optional[str] = None
-    autostart_job: Optional[str] = None
+    current_phrase: Optional[str] = None               # cụm 2 từ hợp lệ gần nhất
+    used: Set[str] = field(default_factory=set)        # các cụm đã dùng (lower)
+    # timer:
+    start_ts: float = 0.0                              # thời điểm bắt đầu lượt
+    half_job_name: Optional[str] = None
+    timeout_job_name: Optional[str] = None
+    auto_begin_job_name: Optional[str] = None
+    # cờ: đã gõ gì trong lượt chưa (để 30s mới nhắc)
+    spoke_in_turn: bool = False
 
-ROOMS: Dict[int, Match] = {}
+matches: Dict[int, Match] = {}  # chat_id -> Match
 
-def get_match(cid: int) -> Match:
-    if cid not in ROOMS:
-        ROOMS[cid] = Match(chat_id=cid)
-    return ROOMS[cid]
+# ====== TIỆN ÍCH ======
+def mention_html(user: User) -> str:
+    name = (user.full_name or user.username or str(user.id))
+    return f"<a href=\"tg://user?id={user.id}\">{name}</a>"
 
-# ================== HẸN GIỜ ==================
-def jobname(kind: str, chat_id: int) -> str:
-    return f"{kind}:{chat_id}"
+def is_valid_phrase(text: str) -> bool:
+    """
+    Đúng 2 từ, mỗi từ >=2 ký tự, và MỖI TỪ đều tồn tại trong từ điển VN_DICT.
+    So khớp theo chữ thường, giữ nguyên dấu tiếng Việt.
+    """
+    if not text:
+        return False
+    norm = " ".join(text.strip().split())  # gọn khoảng trắng
+    parts = norm.split(" ")
+    if len(parts) != 2:
+        return False
+    for p in parts:
+        if len(p) < MIN_WORD_LEN:
+            return False
+        if p.lower() not in VN_DICT:
+            return False
+    return True
 
-async def cancel_job(context: ContextTypes.DEFAULT_TYPE, name: Optional[str]):
-    if not name: return
-    for j in context.application.job_queue.get_jobs_by_name(name):
-        j.schedule_removal()
+def pick_first_turn(match: Match, context: ContextTypes.DEFAULT_TYPE) -> None:
+    random.shuffle(match.alive)
+    match.turn_idx = 0
+    match.spoke_in_turn = False
+    match.current_phrase = None
 
-async def set_turn_timers(context: ContextTypes.DEFAULT_TYPE, m: Match):
-    await cancel_job(context, m.halftime_job)
-    await cancel_job(context, m.timeout_job)
-    hname = jobname("half", m.chat_id)
-    tname = jobname("timeout", m.chat_id)
-    context.application.job_queue.run_once(half_notify, HALFTIME_SECONDS, name=hname, data=m.chat_id)
-    context.application.job_queue.run_once(deadline_kick, ROUND_SECONDS,   name=tname, data=m.chat_id)
-    m.halftime_job, m.timeout_job = hname, tname
+def curr_player_id(match: Match) -> int:
+    return match.alive[match.turn_idx % len(match.alive)]
 
-async def half_notify(context: ContextTypes.DEFAULT_TYPE):
-    cid = context.job.data
-    m = ROOMS.get(cid)
-    if not m or not m.active or not m.players: return
-    uid = m.players[m.turn_idx]
-    await context.bot.send_message(cid, f"⏳ {m.names.get(uid, 'Bạn')}: {random.choice(HALF_WARNINGS)}")
-
-async def deadline_kick(context: ContextTypes.DEFAULT_TYPE):
-    cid = context.job.data
-    m = ROOMS.get(cid)
-    if not m or not m.active or not m.players: return
-    await context.bot.send_message(cid, f"⏰ {TIMEOUT_REPLY}")
-    # loại người tới lượt
-    if m.players:
-        m.players.pop(m.turn_idx)
-    if len(m.players) <= 1:
-        await declare_winner(context, m); return
-    m.turn_idx %= len(m.players)
-    await announce_turn(context, m)
-
-async def declare_winner(context: ContextTypes.DEFAULT_TYPE, m: Match):
-    await cancel_job(context, m.halftime_job)
-    await cancel_job(context, m.timeout_job)
-    m.active = False
-    if m.players:
-        champ = m.players[0]
-        await context.bot.send_message(m.chat_id, f"🏆 {m.names.get(champ, 'người chơi')} là người chiến thắng! Chúc mừng!")
-    m.current_phrase = None
-
-# ================== THÔNG BÁO LƯỢT ==================
-async def announce_turn(context: ContextTypes.DEFAULT_TYPE, m: Match):
-    uid = m.players[m.turn_idx]
-    law = f"🔁 Luật: đúng 2 từ • mỗi từ ≥{MIN_WORD_LEN} ký tự • cụm phải có trong từ điển • nối vần theo từ cuối."
-    prev = f"Từ trước: {m.current_phrase}" if m.current_phrase else "→ Gửi cụm bất kỳ (nhưng phải có trong từ điển)."
-    await context.bot.send_message(m.chat_id, f"{law}\n👉 {m.names.get(uid, 'Bạn')} đến lượt. {prev}")
-    await set_turn_timers(context, m)
-
-# ================== LỆNH ==================
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Chào cả nhà! /newgame để mở sảnh, /join để tham gia. "
-        "Nếu không ai /begin, bot sẽ tự bắt đầu sau 60s.\n"
-        f"Từ điển hiện có: {len(PHRASES)} cụm 2 từ."
+async def send_rules(context: ContextTypes.DEFAULT_TYPE, chat_id: int, who_first: User):
+    await context.bot.send_message(
+        chat_id,
+        f"{RULES_TEXT}\n\n👉 {mention_html(who_first)} đi trước. Gửi cụm hợp lệ bất kỳ.",
+        parse_mode=ParseMode.HTML
     )
 
-async def cmd_newgame(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat = update.effective_chat; user = update.effective_user
-    m = get_match(chat.id)
-    # reset
-    m.lobby.clear(); m.players.clear(); m.active = False
-    m.turn_idx = 0; m.current_phrase = None
-    await cancel_job(context, m.autostart_job)
-    await update.message.reply_text("🎮 Sảnh mở! /join để tham gia. Không ai /begin thì 60s nữa tự bắt đầu.")
-    # người tạo auto-join
-    m.lobby.add(user.id); m.names[user.id] = user.full_name
-    await context.bot.send_message(chat.id, f"➕ {user.full_name} đã tham gia!")
-    # đặt auto-begin
-    aname = jobname("autobegin", chat.id)
-    context.application.job_queue.run_once(auto_begin, AUTO_BEGIN_AFTER, name=aname, data=chat.id)
-    m.autostart_job = aname
-
-async def auto_begin(context: ContextTypes.DEFAULT_TYPE):
-    cid = context.job.data
-    m = ROOMS.get(cid)
-    if not m or m.active: return
-    if len(m.lobby) >= MIN_PLAYERS:
-        await begin_game(context, m)
+async def announce_turn(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
+    match = matches[chat_id]
+    uid = curr_player_id(match)
+    member = await context.bot.get_chat_member(chat_id, uid)
+    if match.current_phrase:
+        await context.bot.send_message(
+            chat_id,
+            f"🔁 {mention_html(member.user)} đến lượt! "
+            f"→ Gửi **cụm 2 từ** có nghĩa (không trùng).",
+            parse_mode=ParseMode.MARKDOWN
+        )
     else:
-        await context.bot.send_message(cid, "⏸️ Không đủ người chơi. /newgame để mở lại sảnh.")
+        await context.bot.send_message(
+            chat_id,
+            f"🟢 {mention_html(member.user)} đi trước. Gửi **cụm 2 từ** có nghĩa bất kỳ.",
+            parse_mode=ParseMode.HTML
+        )
+    match.spoke_in_turn = False
+    await set_turn_timers(context, chat_id)
 
-async def cmd_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    m = get_match(update.effective_chat.id)
-    uid = update.effective_user.id
-    if uid not in m.lobby:
-        m.lobby.add(uid); m.names[uid] = update.effective_user.full_name
-        await update.message.reply_text("Đã tham gia!")
+async def set_turn_timers(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
+    match = matches[chat_id]
+    # huỷ job cũ
+    await cancel_job_by_name(context, match.half_job_name)
+    await cancel_job_by_name(context, match.timeout_job_name)
 
-async def cmd_begin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    m = get_match(update.effective_chat.id)
-    await begin_game(context, m)
+    half_name = f"half_{chat_id}"
+    to_name = f"timeout_{chat_id}"
+    match.half_job_name = half_name
+    match.timeout_job_name = to_name
 
-async def begin_game(context: ContextTypes.DEFAULT_TYPE, m: Match):
-    if m.active: return
-    if len(m.lobby) < MIN_PLAYERS:
-        await context.bot.send_message(m.chat_id, "Cần thêm người chơi để bắt đầu."); return
-    m.players = list(m.lobby); random.shuffle(m.players)
-    m.turn_idx = 0; m.active = True; m.current_phrase = None
-    await context.bot.send_message(m.chat_id, "🚀 Bắt đầu! Sai luật hoặc hết giờ sẽ bị loại.")
-    await announce_turn(context, m)
+    context.job_queue.run_once(half_warn_cb, ROUND_SECONDS // 2, chat_id=chat_id, name=half_name)
+    context.job_queue.run_once(timeout_cb, ROUND_SECONDS, chat_id=chat_id, name=to_name)
 
-async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    m = get_match(update.effective_chat.id)
-    m.active = False
-    await cancel_job(context, m.halftime_job)
-    await cancel_job(context, m.timeout_job)
-    await update.message.reply_text("⛔ Đã dừng game.")
+async def cancel_job_by_name(context: ContextTypes.DEFAULT_TYPE, name: Optional[str]):
+    if not name:
+        return
+    for job in context.job_queue.get_jobs_by_name(name):
+        job.schedule_removal()
 
-# ================== XỬ LÝ VĂN BẢN ==================
-async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message or not update.message.text: return
-    cid = update.effective_chat.id; uid = update.effective_user.id
-    m = ROOMS.get(cid)
-    if not m or not m.active or not m.players: return
-    if uid != m.players[m.turn_idx]: return
+# 30s cảnh báo
+async def half_warn_cb(context: ContextTypes.DEFAULT_TYPE):
+    chat_id = context.job.chat_id
+    match = matches.get(chat_id)
+    if not match or not match.active:
+        return
+    if not match.spoke_in_turn:
+        await context.bot.send_message(chat_id, "⚠️ " + random.choice(HALF_WARNINGS))
 
-    text = update.message.text.strip()
+# 60s hết giờ -> loại
+async def timeout_cb(context: ContextTypes.DEFAULT_TYPE):
+    chat_id = context.job.chat_id
+    match = matches.get(chat_id)
+    if not match or not match.active:
+        return
+    # nếu tới đây mà vẫn chưa nói ra cụm hợp lệ => loại
+    await eliminate_current_player(context, chat_id, by_timeout=True)
 
-    # Luật: 2 từ, có trong từ điển, nối vần
-    ok, toks = is_two_words(text)
-    if not ok or not in_dictionary_two_word(text) or not same_rhyme(m.current_phrase, text):
-        await update.message.reply_text(f"❌ {random.choice(WRONG_REPLIES)}")
-        # loại người hiện tại
-        m.players.pop(m.turn_idx)
-        if len(m.players) <= 1:
-            await declare_winner(context, m); return
-        m.turn_idx %= len(m.players)
-        await announce_turn(context, m)
+async def eliminate_current_player(context: ContextTypes.DEFAULT_TYPE, chat_id: int, by_timeout: bool = False):
+    match = matches.get(chat_id)
+    if not match or not match.active:
+        return
+    uid = curr_player_id(match)
+    member = await context.bot.get_chat_member(chat_id, uid)
+    msg = TIMEOUT_MESSAGE if by_timeout else random.choice(WRONG_MESSAGES)
+    await context.bot.send_message(chat_id, f"❌ {mention_html(member.user)}: {msg}", parse_mode=ParseMode.HTML)
+
+    # loại người chơi
+    match.alive.pop(match.turn_idx % len(match.alive))
+    # kết thúc?
+    if len(match.alive) == 1:
+        winner = match.alive[0]
+        member = await context.bot.get_chat_member(chat_id, winner)
+        await context.bot.send_message(
+            chat_id,
+            f"🏆 {mention_html(member.user)} chiến thắng! Chúc mừng 🎉",
+            parse_mode=ParseMode.HTML
+        )
+        match.active = False
+        await cancel_job_by_name(context, match.half_job_name)
+        await cancel_job_by_name(context, match.timeout_job_name)
         return
 
-    # Hợp lệ
-    m.current_phrase = text
-    await update.message.reply_text("✅ Hợp lệ. Tới lượt kế tiếp!")
-    m.turn_idx = (m.turn_idx + 1) % len(m.players)
-    await announce_turn(context, m)
+    # chuyển lượt (không tăng turn_idx vì đã pop phần tử hiện tại)
+    match.spoke_in_turn = False
+    await announce_turn(context, chat_id)
 
-# ================== APP ==================
+# ====== LỆNH ======
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Xin chào! Dùng /newgame để mở sảnh, /join để tham gia, /begin để bắt đầu ngay.\n" +
+        RULES_TEXT
+    )
+
+async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Pong!")
+
+async def cmd_newgame(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    m = matches.get(chat_id)
+    if m and m.active:
+        await update.message.reply_text("⚠️ Ván hiện tại đang chạy.")
+        return
+
+    match = Match(chat_id=chat_id)
+    matches[chat_id] = match
+    await update.message.reply_text(
+        "🎮 Sảnh mở! /join để tham gia. Không ai /begin thì 60s nữa tự bắt đầu."
+    )
+
+    # Auto-begin sau 60s
+    name = f"auto_begin_{chat_id}"
+    match.auto_begin_job_name = name
+    context.job_queue.run_once(auto_begin_cb, AUTO_BEGIN_SECONDS, chat_id=chat_id, name=name)
+
+async def auto_begin_cb(context: ContextTypes.DEFAULT_TYPE):
+    chat_id = context.job.chat_id
+    match = matches.get(chat_id)
+    if not match or match.active:
+        return
+    # nếu có ít nhất 1 người thì bắt
+    if not match.players:
+        await context.bot.send_message(chat_id, "⛔ Không ai tham gia, hủy sảnh.")
+        matches.pop(chat_id, None)
+        return
+    await cmd_begin(None, context, chat_id=chat_id)
+
+async def cmd_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    user = update.effective_user
+    match = matches.get(chat_id)
+    if not match:
+        await update.message.reply_text("❗ Chưa mở sảnh. Dùng /newgame trước.")
+        return
+    if user.id in match.players:
+        await update.message.reply_text("Bạn đã tham gia!")
+        return
+    match.players.append(user.id)
+    match.alive.append(user.id)
+    await update.message.reply_text("✅ Đã tham gia!")
+
+async def cmd_begin(update: Optional[Update], context: ContextTypes.DEFAULT_TYPE, chat_id: Optional[int] = None):
+    if chat_id is None:
+        chat_id = update.effective_chat.id  # type: ignore
+    match = matches.get(chat_id)
+    if not match:
+        await context.bot.send_message(chat_id, "❗ Chưa mở sảnh. /newgame trước nhé.")
+        return
+    if match.active:
+        await context.bot.send_message(chat_id, "⚠️ Ván đang chạy.")
+        return
+    if not match.players:
+        await context.bot.send_message(chat_id, "❗ Không có ai tham gia, hủy sảnh.")
+        matches.pop(chat_id, None)
+        return
+
+    # vào game
+    match.active = True
+    random.shuffle(match.alive)
+    pick_first_turn(match, context)
+    await context.bot.send_message(chat_id, "🚀 Bắt đầu! Sai luật hoặc hết giờ sẽ bị loại.")
+    # người đầu
+    first_user = await context.bot.get_chat_member(chat_id, curr_player_id(match))
+    await send_rules(context, chat_id, first_user.user)
+    await announce_turn(context, chat_id)
+
+async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    m = matches.pop(chat_id, None)
+    if not m:
+        await update.message.reply_text("Không có ván nào đang mở.")
+        return
+    await cancel_job_by_name(context, m.half_job_name)
+    await cancel_job_by_name(context, m.timeout_job_name)
+    await cancel_job_by_name(context, m.auto_begin_job_name)
+    await update.message.reply_text("⛔ Đã dừng ván.")
+
+# ====== XỬ LÝ VĂN BẢN ======
+async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg: Message = update.message
+    chat_id = msg.chat_id
+    user = msg.from_user
+
+    match = matches.get(chat_id)
+    if not match or not match.active:
+        return
+
+    # Không phải lượt người này -> bỏ qua
+    if user.id != curr_player_id(match):
+        return
+
+    text = " ".join((msg.text or "").strip().split())
+    match.spoke_in_turn = True   # đã nói gì đó trong lượt
+
+    # Kiểm tra cụm 2 từ có nghĩa
+    if not is_valid_phrase(text):
+        # loại ngay theo yêu cầu
+        await eliminate_current_player(context, chat_id, by_timeout=False)
+        return
+
+    # Không được trùng cụm đã dùng
+    key = text.lower()
+    if key in match.used:
+        await eliminate_current_player(context, chat_id, by_timeout=False)
+        return
+
+    # chấp nhận
+    match.used.add(key)
+    match.current_phrase = text
+
+    # chuyển lượt
+    match.turn_idx = (match.turn_idx + 1) % len(match.alive)
+    await msg.reply_text("✅ Hợp lệ. Tới lượt kế tiếp!")
+    await announce_turn(context, chat_id)
+
+# ====== KHỞI TẠO APP TELEGRAM + WEBHOOK ======
 def build_app() -> Application:
     if not TOKEN:
-        raise RuntimeError("Thiếu TELEGRAM_TOKEN (Environment > Add Variable)")
+        raise RuntimeError("Thiếu TELEGRAM_TOKEN trong biến môi trường.")
     app = ApplicationBuilder().token(TOKEN).build()
-    app.add_handler(CommandHandler("start",   cmd_start))
+
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("ping", cmd_ping))
     app.add_handler(CommandHandler("newgame", cmd_newgame))
-    app.add_handler(CommandHandler("join",    cmd_join))
-    app.add_handler(CommandHandler("begin",   cmd_begin))
-    app.add_handler(CommandHandler("stop",    cmd_stop))
+    app.add_handler(CommandHandler("join", cmd_join))
+    app.add_handler(CommandHandler("begin", cmd_begin))
+    app.add_handler(CommandHandler("stop", cmd_stop))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     return app
+
+tg_app = build_app()
+
+# FastAPI webhook (Render/Heroku dùng uvicorn chạy file này)
+api = FastAPI()
+
+@api.get("/")
+async def root():
+    return {"status": "ok"}
+
+@api.post("/telegram/webhook")
+async def telegram_webhook(request: Request):
+    data = await request.json()
+    update = Update.de_json(data, tg_app.bot)
+    await tg_app.process_update(update)
+    return {"ok": True}
