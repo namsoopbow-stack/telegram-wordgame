@@ -1,26 +1,19 @@
-import os, hmac, hashlib
-from fastapi import FastAPI, Request, HTTPException
+# webhook.py
+from fastapi import FastAPI, Request
 from telegram import Update
-from telegram.ext import Application
 from bot import build_application
 
 app = FastAPI()
-_application = None
+tg_app = build_application()  # tạo 1 lần
 
-async def get_app():
-    global _application
-    if _application is None:
-        token = os.environ["TELEGRAM_TOKEN"]
-        _application = await build_application(token)
-    return _application
+@app.get("/")
+async def root():
+    return {"status": "ok"}
 
 @app.post("/telegram/webhook")
 async def telegram_webhook(request: Request):
-    appTG = await get_app()
-    update = Update.de_json(data=(await request.json()), bot=appTG.bot)
-    await appTG.update_queue.put(update)
+    data = await request.json()
+    print(">> incoming update:", str(data)[:300])  # log ngắn để debug
+    update = Update.de_json(data, tg_app.bot)
+    await tg_app.process_update(update)
     return {"ok": True}
-
-@app.get("/")
-async def health():
-    return {"status": "ok"}
