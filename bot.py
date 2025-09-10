@@ -5,21 +5,21 @@ from typing import Dict, List, Optional, Set, Tuple
 from unidecode import unidecode
 
 from telegram import Update
-from telegram.constants import ParseMode
 from telegram.ext import (
     Application, ApplicationBuilder, CommandHandler,
     MessageHandler, ContextTypes, filters,
 )
 
-# ====== CẤU HÌNH (ENV) ======
+# ================== CẤU HÌNH (ENV) ==================
 TOKEN            = os.getenv("TELEGRAM_TOKEN", "").strip()
-ROUND_SECONDS    = int(os.getenv("ROUND_SECONDS", "60"))    # 60s mỗi lượt
-HALFTIME_SECONDS = int(os.getenv("HALFTIME_SECONDS", "30")) # nhắc giữa lượt
-AUTO_BEGIN_AFTER = int(os.getenv("AUTO_BEGIN_AFTER", "60")) # tự bắt đầu sau 60s
-MIN_PLAYERS      = int(os.getenv("MIN_PLAYERS", "1"))       # >=1 người là bắt đầu
-MIN_WORD_LEN     = int(os.getenv("MIN_WORD_LEN", "2"))      # mỗi từ ≥ 2 ký tự
-EXACT_WORDS      = 2                                        # bắt buộc đúng 2 từ
+ROUND_SECONDS    = int(os.getenv("ROUND_SECONDS", "60"))     # 60s mỗi lượt
+HALFTIME_SECONDS = int(os.getenv("HALFTIME_SECONDS", "30"))  # nhắc 30s
+AUTO_BEGIN_AFTER = int(os.getenv("AUTO_BEGIN_AFTER", "60"))  # tự bắt đầu sau 60s
+MIN_PLAYERS      = int(os.getenv("MIN_PLAYERS", "1"))        # ≥1 người là bắt đầu
+MIN_WORD_LEN     = int(os.getenv("MIN_WORD_LEN", "2"))       # mỗi từ ≥2 ký tự
+EXACT_WORDS      = 2                                         # bắt buộc đúng 2 từ
 
+# ================== THÔNG ĐIỆP ==================
 HALF_WARNINGS = [
     "Còn 30 giây cuối để bạn suy nghĩ về cuộc đời:))",
     "Tắc ẻ đến vậy sao, 30 giây cuối nè :||",
@@ -38,10 +38,9 @@ WRONG_REPLIES = [
 ]
 TIMEOUT_REPLY = "Hết giờ, mời bạn ra ngoài chờ!!"
 
-# ====== ĐƯỜNG DẪN TỪ ĐIỂN ======
-BASE_DIR   = os.path.dirname(__file__)
-PHRASES_FP = os.path.join(BASE_DIR, "data", "vi_phrases.txt")
-WORDS_FP   = os.path.join(BASE_DIR, "data", "vi_words.txt")
+# ================== TỪ ĐIỂN (CHỈ DÙNG PHRASES.TXT) ==================
+BASE_DIR = os.path.dirname(__file__)
+PHRASES_FP = os.path.join(BASE_DIR, "data", "phrases.txt")   # <-- file bạn tự lưu
 
 def _read_lines(path: str) -> List[str]:
     out = []
@@ -52,22 +51,22 @@ def _read_lines(path: str) -> List[str]:
                 if s and not s.startswith("#"):
                     out.append(s)
     except FileNotFoundError:
+        # Nếu thiếu file, để rỗng -> mọi câu đều bị sai (đúng yêu cầu: chỉ nhận cụm có trong từ điển)
         pass
     return out
 
 def normalize(s: str) -> str:
-    # lower + bỏ dấu + chỉ giữ chữ/số & khoảng trắng
+    # lower + bỏ dấu + giữ chữ/số/khoảng trắng
     s = s.lower().replace("đ", "d")
     s = unidecode(s)
     s = re.sub(r"[^a-z0-9\s]", " ", s)
     s = re.sub(r"\s+", " ", s).strip()
     return s
 
-# Load từ điển
+# Tập cụm 2 từ có nghĩa (chuẩn hoá để so khớp nhanh)
 PHRASES: Set[str] = set(normalize(x) for x in _read_lines(PHRASES_FP))
-WORDS:   Set[str] = set(normalize(x) for x in _read_lines(WORDS_FP))
 
-# ====== VẦN (rhyme) ======
+# ================== HÀM VẦN (rhyme) ==================
 _VOWEL_KEY_RE = re.compile(r"[aeiouy]+[a-z]*$")   # lấy cụm nguyên âm + phụ âm cuối
 
 def last_word(text: str) -> str:
@@ -76,16 +75,17 @@ def last_word(text: str) -> str:
 
 def rhyme_key(syllable: str) -> str:
     base = normalize(syllable)
-    if not base: return ""
+    if not base:
+        return ""
     m = _VOWEL_KEY_RE.search(base)
     return m.group(0) if m else (base[-2:] if len(base) >= 2 else base)
 
 def same_rhyme(prev_phrase: Optional[str], new_phrase: str) -> bool:
     if not prev_phrase:
-        return True
+        return True  # lượt đầu tiên, không cần so vần
     return rhyme_key(last_word(prev_phrase)) == rhyme_key(last_word(new_phrase))
 
-# ====== KIỂM TRA LUẬT ======
+# ================== KIỂM TRA LUẬT ==================
 def is_two_words(text: str) -> Tuple[bool, List[str]]:
     toks = normalize(text).split()
     if len(toks) != EXACT_WORDS:
@@ -94,16 +94,15 @@ def is_two_words(text: str) -> Tuple[bool, List[str]]:
         return False, toks
     return True, toks
 
-def is_meaningful_two_word(text: str) -> bool:
+def in_dictionary_two_word(text: str) -> bool:
+    """Chỉ chấp nhận nếu cụm 2 từ này có trong data/phrases.txt (đã normalize)."""
     ok, toks = is_two_words(text)
-    if not ok: return False
+    if not ok:
+        return False
     norm = " ".join(toks)
-    # CHỈ dùng từ điển: cụm có trong phrases HOẶC (cả 2 từ đều có trong words)
-    if norm in PHRASES:
-        return True
-    return all(t in WORDS for t in toks)
+    return norm in PHRASES
 
-# ====== TRẠNG THÁI ======
+# ================== TRẠNG THÁI VÁN ==================
 @dataclass
 class Match:
     chat_id: int
@@ -124,7 +123,7 @@ def get_match(cid: int) -> Match:
         ROOMS[cid] = Match(chat_id=cid)
     return ROOMS[cid]
 
-# ====== JOB/TIMER ======
+# ================== HẸN GIỜ ==================
 def jobname(kind: str, chat_id: int) -> str:
     return f"{kind}:{chat_id}"
 
@@ -154,6 +153,7 @@ async def deadline_kick(context: ContextTypes.DEFAULT_TYPE):
     m = ROOMS.get(cid)
     if not m or not m.active or not m.players: return
     await context.bot.send_message(cid, f"⏰ {TIMEOUT_REPLY}")
+    # loại người tới lượt
     if m.players:
         m.players.pop(m.turn_idx)
     if len(m.players) <= 1:
@@ -170,19 +170,20 @@ async def declare_winner(context: ContextTypes.DEFAULT_TYPE, m: Match):
         await context.bot.send_message(m.chat_id, f"🏆 {m.names.get(champ, 'người chơi')} là người chiến thắng! Chúc mừng!")
     m.current_phrase = None
 
-# ====== THÔNG BÁO LƯỢT ======
+# ================== THÔNG BÁO LƯỢT ==================
 async def announce_turn(context: ContextTypes.DEFAULT_TYPE, m: Match):
     uid = m.players[m.turn_idx]
-    law = f"🔁 Luật: vần • đúng 2 từ • mỗi từ ≥{MIN_WORD_LEN} ký tự • phải có nghĩa (theo từ điển)."
-    prev = f"Từ trước: {m.current_phrase}" if m.current_phrase else "→ Gửi cụm hợp lệ bất kỳ."
+    law = f"🔁 Luật: đúng 2 từ • mỗi từ ≥{MIN_WORD_LEN} ký tự • cụm phải có trong từ điển • nối vần theo từ cuối."
+    prev = f"Từ trước: {m.current_phrase}" if m.current_phrase else "→ Gửi cụm bất kỳ (nhưng phải có trong từ điển)."
     await context.bot.send_message(m.chat_id, f"{law}\n👉 {m.names.get(uid, 'Bạn')} đến lượt. {prev}")
     await set_turn_timers(context, m)
 
-# ====== LỆNH ======
+# ================== LỆNH ==================
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Chào cả nhà! /newgame để mở sảnh, /join để tham gia. "
-        "Nếu không ai /begin, bot sẽ tự bắt đầu sau 60s."
+        "Nếu không ai /begin, bot sẽ tự bắt đầu sau 60s.\n"
+        f"Từ điển hiện có: {len(PHRASES)} cụm 2 từ."
     )
 
 async def cmd_newgame(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -237,7 +238,7 @@ async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await cancel_job(context, m.timeout_job)
     await update.message.reply_text("⛔ Đã dừng game.")
 
-# ====== XỬ LÝ VĂN BẢN ======
+# ================== XỬ LÝ VĂN BẢN ==================
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text: return
     cid = update.effective_chat.id; uid = update.effective_user.id
@@ -246,22 +247,26 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if uid != m.players[m.turn_idx]: return
 
     text = update.message.text.strip()
+
+    # Luật: 2 từ, có trong từ điển, nối vần
     ok, toks = is_two_words(text)
-    if not ok or not is_meaningful_two_word(text) or not same_rhyme(m.current_phrase, text):
+    if not ok or not in_dictionary_two_word(text) or not same_rhyme(m.current_phrase, text):
         await update.message.reply_text(f"❌ {random.choice(WRONG_REPLIES)}")
+        # loại người hiện tại
         m.players.pop(m.turn_idx)
-        if len(m.players) <= 1: await declare_winner(context, m); return
+        if len(m.players) <= 1:
+            await declare_winner(context, m); return
         m.turn_idx %= len(m.players)
         await announce_turn(context, m)
         return
 
-    # hợp lệ
+    # Hợp lệ
     m.current_phrase = text
     await update.message.reply_text("✅ Hợp lệ. Tới lượt kế tiếp!")
     m.turn_idx = (m.turn_idx + 1) % len(m.players)
     await announce_turn(context, m)
 
-# ====== APP ======
+# ================== APP ==================
 def build_app() -> Application:
     if not TOKEN:
         raise RuntimeError("Thiếu TELEGRAM_TOKEN (Environment > Add Variable)")
