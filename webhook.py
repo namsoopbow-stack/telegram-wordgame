@@ -1,11 +1,11 @@
 # webhook.py
 from fastapi import FastAPI, Request
-from bot import get_app
+from telegram import Update
+from bot import build_app
 
 app = FastAPI()
-tg_app = get_app()
+tg_app = build_app()
 
-# Khởi động/ tắt Application để có job_queue, timers, v.v.
 @app.on_event("startup")
 async def _startup():
     await tg_app.initialize()
@@ -23,6 +23,6 @@ async def root():
 @app.post("/telegram/webhook")
 async def telegram_webhook(request: Request):
     data = await request.json()
-    # Đẩy update vào hàng đợi của PTB
-    await tg_app.update_queue.put(data)
+    update = Update.de_json(data, tg_app.bot)
+    await tg_app.process_update(update)
     return {"ok": True}
