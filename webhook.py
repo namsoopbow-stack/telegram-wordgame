@@ -19,12 +19,12 @@ async def on_shutdown():
     await tg_app.stop()
     await tg_app.shutdown()
 
-# Endpoint kiểm tra server
+# Healthcheck
 @app.get("/")
 async def root():
     return {"status": "ok"}
 
-# Endpoint nhận webhook từ Telegram
+# Webhook nhận update từ Telegram
 @app.post("/telegram/webhook")
 async def telegram_webhook(request: Request):
     try:
