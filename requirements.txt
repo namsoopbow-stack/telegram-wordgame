@@ -3,4 +3,6 @@ fastapi==0.115.0
 uvicorn==0.30.6
 rapidfuzz==3.9.6
 aiosqlite==0.20.0
-STRICT_DICT = 1
+python-telegram-bot==21.4
+fastapi==0.115.0
+uvicorn==0.30.6
