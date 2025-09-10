@@ -1,4 +1,5 @@
 import os, re, time, unicodedata, asyncio, aiosqlite
+from telegram.ext import CommandHandler
 from dataclasses import dataclass, field
 from collections import deque
 from typing import Optional, Set, Dict, Tuple
@@ -90,6 +91,8 @@ async def build_application(token:str)->Application:
     app.add_handler(CommandHandler("join", cmd_join))
     app.add_handler(CommandHandler("begin", cmd_begin))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+    app.add_handler(CommandHandler("start", cmd_start))
+app.add_handler(CommandHandler("ping",  cmd_ping))
     return app
 
 def get_match(context: ContextTypes.DEFAULT_TYPE, chat_id:int)->Match:
@@ -107,6 +110,13 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• /begin – bắt đầu\n"
         f"Luật: {DEFAULT_MODE}, {ROUND_SECONDS}s/lượt, tối thiểu {MIN_WORD_LEN} ký tự."
     )
+    async def cmd_start(update, context):
+    await update.message.reply_text(
+        "🤖 Bot đối chữ đã sẵn sàng!\nLệnh chính: /newgame, /join, /begin"
+    )
+
+async def cmd_ping(update, context):
+    await update.message.reply_text("pong ✅")
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await cmd_start(update, context)
