@@ -5,18 +5,31 @@ from bot import build_application
 import traceback
 
 app = FastAPI()
-tg_app = build_application()  # tạo Application đúng 1 lần
+tg_app = build_application()  # tạo Application 1 lần
 
+# Khởi động bot khi server start
+@app.on_event("startup")
+async def on_startup():
+    await tg_app.initialize()
+    await tg_app.start()        # bật JobQueue & các handler
+
+# Tắt bot khi server stop
+@app.on_event("shutdown")
+async def on_shutdown():
+    await tg_app.stop()
+    await tg_app.shutdown()
+
+# Endpoint kiểm tra server
 @app.get("/")
 async def root():
     return {"status": "ok"}
 
+# Endpoint nhận webhook từ Telegram
 @app.post("/telegram/webhook")
 async def telegram_webhook(request: Request):
     try:
         data = await request.json()
     except Exception:
-        # Nếu parse JSON fail, log raw body và trả 200 để tránh 500
         raw = await request.body()
         print("!! cannot parse json, raw body:", raw[:500])
         return {"ok": True}
@@ -28,6 +41,4 @@ async def telegram_webhook(request: Request):
     except Exception as e:
         print("!! ERROR processing update:", e)
         traceback.print_exc()
-        # vẫn trả 200 để Telegram không lặp lại lỗi 500
-        # (nhưng log vẫn cho ta biết lỗi gì)
     return {"ok": True}
