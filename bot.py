@@ -48,27 +48,40 @@ SOLO_HINTS = [
     "Cơ hội cuối ! Nếu sai chuẩn bị xuống hàng ghế động vật ngồi !!!",
 ]
 
+# ============ CHUẨN HOÁ ============
+def normalize_text(text: str) -> str:
+    """Bỏ dấu, về chữ thường, rút gọn khoảng trắng."""
+    return " ".join(unidecode(text).lower().strip().split())
+
+def normalize_phrase(text: str) -> str:
+    return normalize_text(text)
+
 # ============ NẠP TỪ ĐIỂN ============
-def _load_dict_file(fname: str) -> Set[str]:
-    s: Set[str] = set()
+def _load_raw_file(fname: str) -> List[str]:
+    """Đọc file dạng raw (giữ nguyên), trả về list dòng hợp lệ (2 từ, chữ cái)."""
+    out = []
     for p in [Path(fname), Path(__file__).parent / fname, Path("/opt/render/project/src") / fname]:
         if p.exists():
             with p.open("r", encoding="utf-8") as f:
                 for line in f:
-                    t = " ".join(line.strip().lower().split())
-                    if not t:
+                    raw = " ".join(line.strip().lower().split())
+                    if not raw:
                         continue
-                    parts = t.split()
+                    parts = raw.split()
                     if len(parts) == 2 and all(part.isalpha() for part in parts):
-                        s.add(t)
+                        out.append(raw)
             break
-    return s
+    return out
 
-DICT: Set[str] = _load_dict_file(DICT_FILE)
-SLANG: Set[str] = _load_dict_file(SLANG_FILE)
-print(f"[DICT] Chuẩn: {len(DICT)} | SLANG: {len(SLANG)}")
+# Tập RAW để hiển thị, và tập NORM để so khớp (bỏ dấu)
+DICT_RAW: List[str] = _load_raw_file(DICT_FILE)
+SLANG_RAW: List[str] = _load_raw_file(SLANG_FILE)
+DICT_NORM: Set[str] = {normalize_phrase(x) for x in DICT_RAW}
+SLANG_NORM: Set[str] = {normalize_phrase(x) for x in SLANG_RAW}
 
-# (Tuỳ chọn) wordfreq + symspell
+print(f"[DICT] Chuẩn: {len(DICT_RAW)} | SLANG: {len(SLANG_RAW)}")
+
+# (Tuỳ chọn) wordfreq + symspell (làm việc trên dạng NORM)
 try:
     from wordfreq import zipf_frequency
 except Exception:
@@ -78,7 +91,7 @@ try:
     from symspellpy import SymSpell, Verbosity
     _sym = SymSpell(max_dictionary_edit_distance=2, prefix_length=7)
     _WORDS = set()
-    for p in (DICT | SLANG):
+    for p in list(DICT_NORM | SLANG_NORM):
         w1, w2 = p.split()
         _WORDS.add(w1); _WORDS.add(w2)
     for w in _WORDS:
@@ -88,12 +101,11 @@ except Exception:
 
 # ============ KIỂM TRA ÂM TIẾT & NGHĨA ============
 def norm2(text: str) -> str:
-    return " ".join(text.strip().lower().split())
+    return normalize_phrase(text)
 
 # Heuristic kiểm tra âm tiết hợp lệ (xấp xỉ)
 _VALID_ONSET = r"(ngh|gh|ng|nh|ch|th|tr|ph|qu|gi|kh|quy|b|c|d|đ|g|h|k|l|m|n|p|q|r|s|t|v|x)?"
-# Nucleus: đơn giản hoá; đủ dùng cho game
-_VALID_NUCLEUS = r"(a|e|i|o|u|y|ai|ao|au|ay|eo|ia|iu|oa|oe|oi|ua|ui|uy|uoi|uya|uya|ye|ya|yo|yu|uu|uo|uou)"
+_VALID_NUCLEUS = r"(a|e|i|o|u|y|ai|ao|au|ay|eo|ia|iu|oa|oe|oi|ua|ui|uy|ye|ya|yo|yu|uo|uoi)"
 _VALID_CODA = r"(c|ch|m|n|ng|nh|p|t)?"
 _SYL_RE = re.compile(rf"^{_VALID_ONSET}{_VALID_NUCLEUS}{_VALID_CODA}$")
 
@@ -107,48 +119,52 @@ def is_valid_syllable_vi(syllable: str) -> bool:
     return bool(_SYL_RE.match(s))
 
 def is_two_word_form(text: str) -> Tuple[bool, List[str]]:
-    t = norm2(text)
-    parts = t.split()
-    if len(parts) != 2:
-        return False, parts
-    if not all(p.isalpha() for p in parts):
-        return False, parts
-    if not all(is_valid_syllable_vi(p) for p in parts):
-        return False, parts
-    return True, parts
+    t_raw = " ".join(text.strip().lower().split())
+    parts_raw = t_raw.split()
+    if len(parts_raw) != 2:
+        return False, parts_raw
+    if not all(p.isalpha() for p in parts_raw):
+        return False, parts_raw
+    # kiểm tra âm tiết (xấp xỉ) trên bản không dấu
+    parts_norm = [normalize_text(w) for w in parts_raw]
+    if not all(is_valid_syllable_vi(p) for p in parts_norm):
+        return False, parts_raw
+    return True, parts_raw
 
 def _freq_ok(w: str) -> bool:
     if not zipf_frequency:
         return False
+    # tính tần suất trên dạng không dấu để ổn định
     return zipf_frequency(w, "vi") >= GENZ_FREQ
 
 def is_meaningful(text: str) -> Tuple[bool, str, Dict]:
     """
     Trả về (ok, normalized_text, info)
-      - Ưu tiên DICT -> SLANG
+      - So khớp trên dạng NORM (bỏ dấu)
+      - Ưu tiên DICT_NORM -> SLANG_NORM
       - Nếu ALLOW_GENZ & có wordfreq: chấp nhận nếu cả 2 từ >= GENZ_FREQ
-      - Nếu có symspell: autocorrect từng từ rồi thử lại
+      - Nếu có symspell: autocorrect từng từ (trên NORM) rồi thử lại
     """
-    t = norm2(text)
-    form_ok, parts = is_two_word_form(t)
+    t_norm = norm2(text)
+    parts_norm = t_norm.split()
     info = {"source": None, "w1": None, "w2": None, "note": None}
-    if not form_ok:
+    if len(parts_norm) != 2:
         info["note"] = "form_invalid"
-        return False, t, info
+        return False, t_norm, info
 
-    w1, w2 = parts
+    w1, w2 = parts_norm
     info["w1"], info["w2"] = w1, w2
 
-    if t in DICT:
+    if t_norm in DICT_NORM:
         info["source"] = "DICT"
-        return True, t, info
-    if ALLOW_GENZ and t in SLANG:
+        return True, t_norm, info
+    if ALLOW_GENZ and t_norm in SLANG_NORM:
         info["source"] = "SLANG"
-        return True, t, info
+        return True, t_norm, info
 
     if ALLOW_GENZ and _freq_ok(w1) and _freq_ok(w2):
         info["source"] = "FREQ"
-        return True, t, info
+        return True, t_norm, info
 
     if _sym:
         sug1 = _sym.lookup(w1, Verbosity.CLOSEST, max_edit_distance=1)
@@ -156,7 +172,7 @@ def is_meaningful(text: str) -> Tuple[bool, str, Dict]:
         c1 = sug1[0].term if sug1 else w1
         c2 = sug2[0].term if sug2 else w2
         cand = f"{c1} {c2}"
-        if cand in DICT or (ALLOW_GENZ and cand in SLANG):
+        if cand in DICT_NORM or (ALLOW_GENZ and cand in SLANG_NORM):
             info["source"] = "CORRECTED"
             return True, cand, info
         if ALLOW_GENZ and _freq_ok(c1) and _freq_ok(c2):
@@ -164,7 +180,7 @@ def is_meaningful(text: str) -> Tuple[bool, str, Dict]:
             return True, cand, info
 
     info["note"] = "not_in_dict"
-    return False, t, info
+    return False, t_norm, info
 
 # ============ RHYME (ĐỐI VẦN) ============
 ONSET_CLUSTERS = ["ngh","gh","ng","nh","ch","th","tr","ph","qu","gi","kh","quy"]
@@ -204,13 +220,13 @@ class Match:
     active: bool = False
     turn_idx: int = 0
     current_player: Optional[int] = None
-    current_phrase: Optional[str] = None
+    current_phrase: Optional[str] = None  # lưu NORM
 
     auto_begin_task: Optional[asyncio.Task] = None
     half_task: Optional[asyncio.Task] = None
     timeout_task: Optional[asyncio.Task] = None
 
-    used_phrases: Set[str] = field(default_factory=set)
+    used_phrases: Set[str] = field(default_factory=set)  # lưu NORM
 
     solo_mode: bool = False
     solo_warn_count: int = 0
@@ -245,14 +261,29 @@ def pick_next_idx(match: Match):
     match.current_player = match.joined[match.turn_idx]
 
 def random_bot_phrase(match: Match) -> Optional[str]:
+    """Chọn RAW để hiển thị, nhưng lọc & so vần trên NORM."""
+    pool_raw = DICT_RAW + SLANG_RAW  # ưu tiên phong phú
+    random.shuffle(pool_raw)
     if not match.current_phrase:
-        candidates = list((DICT | SLANG) - match.used_phrases)
-        return random.choice(candidates) if candidates else None
+        # lượt đầu của bot trong solo: nhả bất kỳ chưa dùng
+        for raw in pool_raw:
+            norm = normalize_phrase(raw)
+            if norm not in match.used_phrases:
+                return raw
+        return None
+
+    # cần cụm có từ 1 cùng vần với từ 2 của cụm trước
     _, prev_last = split_phrase(match.current_phrase)
     need_key = rhyme_key(prev_last)
-    pool = (DICT | SLANG) - match.used_phrases
-    candidates = [p for p in pool if rhyme_key(split_phrase(p)[0]) == need_key]
-    return random.choice(candidates) if candidates else None
+
+    for raw in pool_raw:
+        norm = normalize_phrase(raw)
+        if norm in match.used_phrases:
+            continue
+        w1, _ = split_phrase(norm)
+        if rhyme_key(w1) == need_key:
+            return raw
+    return None
 
 async def schedule_turn_timers(update: Update, context: ContextTypes.DEFAULT_TYPE, match: Match):
     match.cancel_turn_tasks()
@@ -321,15 +352,17 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Chào cả nhà! /newgame để mở sảnh, /join để tham gia.\n"
         f"Đủ 2 người, bot đếm ngược {AUTO_BEGIN_SECONDS}s rồi tự bắt đầu.\n"
-        "Luật: đúng 2 từ, có nghĩa (DICT/SLANG hoặc linh hoạt), và **đối vần**: từ 1 của cụm mới cùng vần với từ 2 của cụm trước.\n"
-        f"Từ điển: {len(DICT)} chuẩn + {len(SLANG)} slang."
+        "Luật: đúng 2 từ, có nghĩa (DICT/SLANG/linh hoạt), và **đối vần**: từ 1 của cụm mới cùng vần với từ 2 của cụm trước.\n"
+        f"Từ điển: {len(DICT_RAW)} chuẩn + {len(SLANG_RAW)} slang."
     )
 
 async def cmd_reload(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global DICT, SLANG
-    DICT = _load_dict_file(DICT_FILE)
-    SLANG = _load_dict_file(SLANG_FILE)
-    await update.message.reply_text(f"🔁 Nạp lại: DICT={len(DICT)} | SLANG={len(SLANG)}")
+    global DICT_RAW, SLANG_RAW, DICT_NORM, SLANG_NORM
+    DICT_RAW = _load_raw_file(DICT_FILE)
+    SLANG_RAW = _load_raw_file(SLANG_FILE)
+    DICT_NORM = {normalize_phrase(x) for x in DICT_RAW}
+    SLANG_NORM = {normalize_phrase(x) for x in SLANG_RAW}
+    await update.message.reply_text(f"🔁 Nạp lại: DICT={len(DICT_RAW)} | SLANG={len(SLANG_RAW)}")
 
 async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("pong ✅")
@@ -432,7 +465,7 @@ async def force_begin(update: Update, context: ContextTypes.DEFAULT_TYPE, m: Mat
         await context.bot.send_message(
             m.chat_id,
             "🤖 Chỉ có 1 người tham gia → SOLO với bot.\n"
-            "📘 Luật: đúng 2 từ • có nghĩa (tục/GenZ linh hoạt) • **đối vần** (từ 1 = vần từ 2 cụm trước)."
+            "📘 Luật: đúng 2 từ • có nghĩa (DICT/SLANG/linh hoạt) • **đối vần** (từ 1 = vần từ 2 cụm trước)."
         )
         who = await mention_user(context, m.chat_id, m.current_player)
         await context.bot.send_message(
@@ -484,14 +517,14 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user_id != m.current_player:
         return
 
-    # 1) Kiểu 2 từ + âm tiết hợp lệ
+    # 1) 2 từ + âm tiết hợp lệ
     form_ok, _ = is_two_word_form(raw)
-    # 2) Nghĩa (lai)
-    meaning_ok, normalized, info = is_meaningful(raw)
+    # 2) Nghĩa
+    meaning_ok, norm, info = is_meaningful(raw)
     # 3) Chưa dùng
-    not_used = normalized not in m.used_phrases
+    not_used = norm not in m.used_phrases
     # 4) Đối vần
-    rhyme_ok = rhyme_match(m.current_phrase, normalized)
+    rhyme_ok = rhyme_match(m.current_phrase, norm)
 
     valid = form_ok and meaning_ok and not_used and rhyme_ok
 
@@ -500,7 +533,6 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if m.solo_warn_count < 3:
                 hint = SOLO_HINTS[m.solo_warn_count] if m.solo_warn_count < len(SOLO_HINTS) else SOLO_HINTS[-1]
                 m.solo_warn_count += 1
-                # Gợi ý ngắn lý do
                 reasons = []
                 if not form_ok: reasons.append("ghép âm/không đúng 2 từ")
                 if not meaning_ok: reasons.append("không thấy nghĩa hợp lệ")
@@ -539,24 +571,28 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
     # ===== HỢP LỆ =====
-    text = normalized
-    m.used_phrases.add(text)
-    m.current_phrase = text
+    m.used_phrases.add(norm)
+    m.current_phrase = norm
 
     if m.solo_mode:
         m.solo_warn_count = 0
         await update.message.reply_text(f"✅ Hợp lệ ({info.get('source') or 'OK'}). Tới lượt bot 🤖")
         m.cancel_turn_tasks()
 
-        bot_pick = random_bot_phrase(m)
-        if not bot_pick or not rhyme_match(m.current_phrase, bot_pick):
+        bot_raw = random_bot_phrase(m)
+        if not bot_raw:
+            await context.bot.send_message(chat_id, "🤖 Hết chữ hợp vần… Bạn thắng! 🏆")
+            m.active = False
+            return
+        bot_norm = normalize_phrase(bot_raw)
+        if not rhyme_match(m.current_phrase, bot_norm):
             await context.bot.send_message(chat_id, "🤖 Hết chữ hợp vần… Bạn thắng! 🏆")
             m.active = False
             return
 
-        m.used_phrases.add(bot_pick)
-        m.current_phrase = bot_pick
-        await context.bot.send_message(chat_id, f"🤖 Bot: **{bot_pick}**", parse_mode=ParseMode.MARKDOWN)
+        m.used_phrases.add(bot_norm)
+        m.current_phrase = bot_norm
+        await context.bot.send_message(chat_id, f"🤖 Bot: **{bot_raw}**", parse_mode=ParseMode.MARKDOWN)
 
         await context.bot.send_message(chat_id, "👉 Tới lượt bạn. Gửi **cụm 2 từ** đúng vần.")
         await schedule_turn_timers(update, context, m)
