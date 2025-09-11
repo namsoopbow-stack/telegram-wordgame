@@ -1,206 +1,135 @@
-gai
-xinh
-dep
-trai
-anh
-chi
-em
-cha
-me
-con
-ban
-be
-thay
-co
-hoc
-sinh
-vien
-nha
-cua
-hang
-mua
-sam
-quan
-ao
-giay
-dep
-tui
-xach
-cay
-xanh
-hoa
-bong
-cho
-meo
-sach
-vo
-ban
-ghe
-sofa
-an
-bep
-phong
-khach
-ngu
-tam
-di
-choi
-hoc
-lam
-viec
-giai
-lao
-nghi
-trua
-sang
-toi
-ngu
-som
-muon
-thu
-gian
-tap
-gym
-da
-ro
-banh
-chay
-bo
-lai
-xe
-may
-dap
-oto
-tau
-hoa
-bay
-ve
-sinh
-rua
-tay
-mat
-danh
-rang
-tam
-na
-duong
-da
-son
-trang
-diem
-u
-toc
-cat
-giat
-do
-phoi
-say
-nau
-com
-kho
-qua
-rau
-muong
-ca
-thit
-canh
-chua
-bun
-pho
-bo
-tam
-banh
-mi
-cuon
-xeo
-tra
-sua
-ca
-phe
-nuoc
-ep
-loc
-nong
-kem
-tuoi
-keo
-deo
-vien
-ngoc
-bach
-kim
-vang
-bac
-dien
-thoai
-may
-tinh
-ban
-phim
-chuot
-man
-hinh
-tai
-nghe
-loa
-bluetooth
-sac
-phong
-wifi
-manh
-lanh
-quat
-tu
-lanh
-may
-giat
-noi
-am
-nuoc
-ui
-đẹp
-trai
-xinh
-gái
-bánh
-mì
-bao
-xèo
-phở
-bò
-bún
-chả
-gấu
-trúc
-cá
-hồi
-thu
-hoa
-hồng
-cúc
-sen
-quả
-cam
-bưởi
-cây
-tre
-lúa
-nước
-mắm
-sữa
-tươi
-bóng
-đá
-rổ
-xe
-máy
-đạp
-máy
-tính
-ảnh
-nhà
-bếp
-tắm
-sân
-bay
-vườn
+pha ke
+xin loi
+chill phai
+chill chill
+bem nhau
+chill chill
+chill phai
+chill alone
+de thuong
+qua xinh
+qua dinh
+qua chat
+yeu em
+yeu anh
+yeu doi
+iu nho
+iu thuong
+iu qua
+iu lam
+iu hong
+iu anh
+ban than
+ban oi
+ban than
+ban than oi
+ban trai
+ban gai
+ban cung
+ban choi
+ban cu
+ban moi
+ban tre
+ban quyen
+ban lac
+ban lon
+ban dep
+ban gai
+ban nu 
+ban the
+ban ngu
+ban than
+lam an
+lam net
+lam giau
+lam viec
+lam choi
+lam an 
+lam cac
+lam can
+lam an 
+lam cho 
+lam nhu
+lam tinh
+lam tuong
+doi thu
+doi thuong
+doi giau
+doi ngheo
+doi net
+doi chat
+doi chill
+doi qua
+doi thu 
+doi chym
+doi cu
+an uong
+an choi
+an vat
+an nhe
+an chua
+an dinh
+an chill
+an ngon
+an net
+an lo
+an lon
+an banh
+an keo
+an trai
+an kem
+an thit
+an ca
+an oc
+an lua
+ngu ngon
+ngu som
+ngu muon
+ngu tron
+ngu trua
+ngu dem
+ngu ngay
+ngu ngon net
+ngu that
+ngu vl
+ngu lon
+nghe nhac
+nghe rap
+nghe chill
+nghe edm
+nghe lo fi
+nghe remix
+nghe thu
+nghe la
+nghe net
+nghe chat
+nghe dinh
+xem phim
+xem chill
+xem net
+xem dinh
+xem rap
+xem game
+xem bong
+xem rap viet
+xem phim hay
+xem phim net
+xem phim chill
+song ao
+song that
+song net
+song chill
+song dinh
+song chat
+song vui
+song khoe
+song tot
+song xanh
+song sach
+song dep
+song ganh
+song nuoc
+song bien
+song tinh
+song doi
+song vui 
