@@ -1,4 +1,5 @@
 import os
+import re
 import random
 import asyncio
 from dataclasses import dataclass, field
@@ -13,11 +14,15 @@ from telegram.ext import (
     MessageHandler, ContextTypes, filters
 )
 
-# ================== CẤU HÌNH / THÔNG ĐIỆP ==================
+# ============ CẤU HÌNH ============
 ROUND_SECONDS = int(os.getenv("ROUND_SECONDS", "60"))
 HALFTIME_SECONDS = int(os.getenv("HALFTIME_SECONDS", str(ROUND_SECONDS // 2)))
 AUTO_BEGIN_SECONDS = int(os.getenv("AUTO_BEGIN_SECONDS", "60"))
 DICT_FILE = os.getenv("DICT_FILE", "dict_vi.txt").strip()
+SLANG_FILE = os.getenv("SLANG_FILE", "slang_vi.txt").strip()
+
+ALLOW_GENZ = os.getenv("ALLOW_GENZ", "1") == "1"   # bật/tắt cơ chế genZ linh hoạt
+GENZ_FREQ = float(os.getenv("GENZ_FREQ", "2.2"))   # ngưỡng wordfreq (0-7)
 
 HALF_WARNINGS = [
     "Còn 30 giây cuối để bạn suy nghĩ về cuộc đời:))",
@@ -37,94 +42,160 @@ WRONG_ANSWERS = [
 ]
 TIMEOUT_MSG = "⏰ Hết giờ, mời bạn ra ngoài chờ !!"
 
-# 3 câu “nhắc” dành cho CHẾ ĐỘ 1 NGƯỜI (sai nhưng chưa loại ngay)
 SOLO_HINTS = [
     "Từ này có nghĩa thật không ? Anh nhắc cưng",
     "Cho bé cơ hội nữa ,",
     "Cơ hội cuối ! Nếu sai chuẩn bị xuống hàng ghế động vật ngồi !!!",
 ]
 
-# ================== NẠP TỪ ĐIỂN 2 TỪ ==================
-def load_dict(path_hint: str = DICT_FILE) -> Set[str]:
-    """Nạp cụm 2 từ (mỗi dòng đúng 2 token chữ cái) từ file DICT_FILE."""
-    search_paths = [
-        Path(path_hint),
-        Path(__file__).parent / path_hint,
-        Path("/opt/render/project/src") / path_hint,  # Render
-    ]
-    used = None
-    ok: Set[str] = set()
-    dropped = 0
-    for p in search_paths:
+# ============ NẠP TỪ ĐIỂN ============
+def _load_dict_file(fname: str) -> Set[str]:
+    s: Set[str] = set()
+    for p in [Path(fname), Path(__file__).parent / fname, Path("/opt/render/project/src") / fname]:
         if p.exists():
-            used = p
             with p.open("r", encoding="utf-8") as f:
                 for line in f:
-                    s = " ".join(line.strip().lower().split())
-                    if not s:
+                    t = " ".join(line.strip().lower().split())
+                    if not t:
                         continue
-                    parts = s.split()
-                    # giữ đúng 2 token, đều là chữ (cho “2 từ/2 vần” chuẩn)
+                    parts = t.split()
                     if len(parts) == 2 and all(part.isalpha() for part in parts):
-                        ok.add(s)
-                    else:
-                        dropped += 1
+                        s.add(t)
             break
-    if used is None:
-        print(f"[DICT] ❌ Không tìm thấy file: {path_hint}")
-    else:
-        print(f"[DICT] ✅ {used} — hợp lệ: {len(ok)} | loại: {dropped}")
-    return ok
+    return s
 
-DICT: Set[str] = load_dict()
+DICT: Set[str] = _load_dict_file(DICT_FILE)
+SLANG: Set[str] = _load_dict_file(SLANG_FILE)
+print(f"[DICT] Chuẩn: {len(DICT)} | SLANG: {len(SLANG)}")
 
-def is_two_word_phrase_in_dict(s: str) -> bool:
-    s = " ".join(s.strip().lower().split())
-    parts = s.split()
+# (Tuỳ chọn) wordfreq + symspell
+try:
+    from wordfreq import zipf_frequency
+except Exception:
+    zipf_frequency = None
+
+try:
+    from symspellpy import SymSpell, Verbosity
+    _sym = SymSpell(max_dictionary_edit_distance=2, prefix_length=7)
+    _WORDS = set()
+    for p in (DICT | SLANG):
+        w1, w2 = p.split()
+        _WORDS.add(w1); _WORDS.add(w2)
+    for w in _WORDS:
+        _sym.create_dictionary_entry(w, 1)
+except Exception:
+    _sym = None
+
+# ============ KIỂM TRA ÂM TIẾT & NGHĨA ============
+def norm2(text: str) -> str:
+    return " ".join(text.strip().lower().split())
+
+# Heuristic kiểm tra âm tiết hợp lệ (xấp xỉ)
+_VALID_ONSET = r"(ngh|gh|ng|nh|ch|th|tr|ph|qu|gi|kh|quy|b|c|d|đ|g|h|k|l|m|n|p|q|r|s|t|v|x)?"
+# Nucleus: đơn giản hoá; đủ dùng cho game
+_VALID_NUCLEUS = r"(a|e|i|o|u|y|ai|ao|au|ay|eo|ia|iu|oa|oe|oi|ua|ui|uy|uoi|uya|uya|ye|ya|yo|yu|uu|uo|uou)"
+_VALID_CODA = r"(c|ch|m|n|ng|nh|p|t)?"
+_SYL_RE = re.compile(rf"^{_VALID_ONSET}{_VALID_NUCLEUS}{_VALID_CODA}$")
+
+def _strip_diacritics(s: str) -> str:
+    return unidecode(s.lower().strip())
+
+def is_valid_syllable_vi(syllable: str) -> bool:
+    s = _strip_diacritics(syllable)
+    if not s.isalpha():
+        return False
+    return bool(_SYL_RE.match(s))
+
+def is_two_word_form(text: str) -> Tuple[bool, List[str]]:
+    t = norm2(text)
+    parts = t.split()
     if len(parts) != 2:
-        return False
-    if not all(part.isalpha() for part in parts):
-        return False
-    return s in DICT
+        return False, parts
+    if not all(p.isalpha() for p in parts):
+        return False, parts
+    if not all(is_valid_syllable_vi(p) for p in parts):
+        return False, parts
+    return True, parts
 
-# ================== RHYME (VẦN) ==================
-# Lấy "vần" tiếng Việt xấp xỉ: bỏ dấu, bỏ phụ âm đầu; giữ nguyên âm + phụ âm cuối.
-# Ví dụ: "cá" -> "a"; "heo" -> "eo"; "trăng" -> "ang"; "quốc" -> "oc"/"uoc" (xấp xỉ).
-# Lưu ý: đây là heuristic đủ dùng để chơi; không phải bộ tách âm vị hoàn hảo.
-ONSET_CLUSTERS = [
-    "ngh","gh","ng","nh","ch","th","tr","ph","qu","gi","kh","th","qu","qu","quy"
-]
+def _freq_ok(w: str) -> bool:
+    if not zipf_frequency:
+        return False
+    return zipf_frequency(w, "vi") >= GENZ_FREQ
+
+def is_meaningful(text: str) -> Tuple[bool, str, Dict]:
+    """
+    Trả về (ok, normalized_text, info)
+      - Ưu tiên DICT -> SLANG
+      - Nếu ALLOW_GENZ & có wordfreq: chấp nhận nếu cả 2 từ >= GENZ_FREQ
+      - Nếu có symspell: autocorrect từng từ rồi thử lại
+    """
+    t = norm2(text)
+    form_ok, parts = is_two_word_form(t)
+    info = {"source": None, "w1": None, "w2": None, "note": None}
+    if not form_ok:
+        info["note"] = "form_invalid"
+        return False, t, info
+
+    w1, w2 = parts
+    info["w1"], info["w2"] = w1, w2
+
+    if t in DICT:
+        info["source"] = "DICT"
+        return True, t, info
+    if ALLOW_GENZ and t in SLANG:
+        info["source"] = "SLANG"
+        return True, t, info
+
+    if ALLOW_GENZ and _freq_ok(w1) and _freq_ok(w2):
+        info["source"] = "FREQ"
+        return True, t, info
+
+    if _sym:
+        sug1 = _sym.lookup(w1, Verbosity.CLOSEST, max_edit_distance=1)
+        sug2 = _sym.lookup(w2, Verbosity.CLOSEST, max_edit_distance=1)
+        c1 = sug1[0].term if sug1 else w1
+        c2 = sug2[0].term if sug2 else w2
+        cand = f"{c1} {c2}"
+        if cand in DICT or (ALLOW_GENZ and cand in SLANG):
+            info["source"] = "CORRECTED"
+            return True, cand, info
+        if ALLOW_GENZ and _freq_ok(c1) and _freq_ok(c2):
+            info["source"] = "CORRECTED+FREQ"
+            return True, cand, info
+
+    info["note"] = "not_in_dict"
+    return False, t, info
+
+# ============ RHYME (ĐỐI VẦN) ============
+ONSET_CLUSTERS = ["ngh","gh","ng","nh","ch","th","tr","ph","qu","gi","kh","quy"]
 CONSONANTS = set(list("bcdfghjklmnpqrstvxđ"))
 
 def rhyme_key(syllable: str) -> str:
-    # chuẩn hóa: lower, bỏ dấu thanh (unidecode), gom space
     syl = unidecode(syllable.lower().strip())
-    # đặc biệt: 'qu' và 'gi' thường coi như phụ âm đầu
     for cl in ONSET_CLUSTERS:
         if syl.startswith(cl):
-            return syl[len(cl):] or syl  # nếu rỗng, trả về chính nó
-    # nếu bắt đầu bằng phụ âm đơn -> bỏ 1 ký tự
+            base = syl[len(cl):]
+            return base or syl
     if syl and syl[0] in CONSONANTS:
         syl = syl[1:]
-    return syl or syllable  # fallback
+    return syl or syllable
 
 def split_phrase(phrase: str) -> Tuple[str, str]:
-    parts = " ".join(phrase.strip().lower().split()).split()
+    parts = norm2(phrase).split()
     if len(parts) != 2:
-        return ("","")
+        return "", ""
     return parts[0], parts[1]
 
 def rhyme_match(prev_phrase: Optional[str], next_phrase: str) -> bool:
-    """Lượt sau phải bắt đầu bằng từ 1 có 'vần' = vần của từ 2 ở cụm trước."""
     if not prev_phrase:
-        return True  # lượt đầu tự do
+        return True
     p1, p2 = split_phrase(prev_phrase)
-    n1, n2 = split_phrase(next_phrase)
+    n1, _ = split_phrase(next_phrase)
     if not (p2 and n1):
         return False
     return rhyme_key(p2) == rhyme_key(n1)
 
-# ================== TRẠNG THÁI TRẬN ==================
+# ============ GAME STATE ============
 @dataclass
 class Match:
     chat_id: int
@@ -133,18 +204,16 @@ class Match:
     active: bool = False
     turn_idx: int = 0
     current_player: Optional[int] = None
-    current_phrase: Optional[str] = None  # cụm hợp lệ trước đó
+    current_phrase: Optional[str] = None
 
-    # tasks
     auto_begin_task: Optional[asyncio.Task] = None
     half_task: Optional[asyncio.Task] = None
     timeout_task: Optional[asyncio.Task] = None
 
     used_phrases: Set[str] = field(default_factory=set)
 
-    # Chế độ 1 người
     solo_mode: bool = False
-    solo_warn_count: int = 0  # số lần đã “nhắc” ở lượt hiện tại
+    solo_warn_count: int = 0
 
     def cancel_turn_tasks(self):
         for t in (self.half_task, self.timeout_task):
@@ -160,7 +229,7 @@ class Match:
 
 matches: Dict[int, Match] = {}
 
-# ================== TIỆN ÍCH ==================
+# ============ TIỆN ÍCH ============
 async def mention_user(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: int) -> str:
     try:
         member = await context.bot.get_chat_member(chat_id, user_id)
@@ -176,20 +245,16 @@ def pick_next_idx(match: Match):
     match.current_player = match.joined[match.turn_idx]
 
 def random_bot_phrase(match: Match) -> Optional[str]:
-    """Bot chọn 1 cụm chưa dùng thỏa vần."""
-    # Người chơi vừa nói -> lấy vần từ 2:
     if not match.current_phrase:
-        # lượt đầu solo: bot nhả ngẫu nhiên
-        candidates = list(DICT - match.used_phrases)
+        candidates = list((DICT | SLANG) - match.used_phrases)
         return random.choice(candidates) if candidates else None
     _, prev_last = split_phrase(match.current_phrase)
     need_key = rhyme_key(prev_last)
-    # cần cụm có từ 1 trùng vần
-    candidates = [p for p in DICT - match.used_phrases if rhyme_key(split_phrase(p)[0]) == need_key]
+    pool = (DICT | SLANG) - match.used_phrases
+    candidates = [p for p in pool if rhyme_key(split_phrase(p)[0]) == need_key]
     return random.choice(candidates) if candidates else None
 
 async def schedule_turn_timers(update: Update, context: ContextTypes.DEFAULT_TYPE, match: Match):
-    """Đặt nhắc 30s và loại sau 60s cho người đang tới lượt (chỉ áp cho người chơi, không áp cho bot)."""
     match.cancel_turn_tasks()
 
     async def half_warn():
@@ -213,14 +278,12 @@ async def schedule_turn_timers(update: Update, context: ContextTypes.DEFAULT_TYP
             who_m = await mention_user(context, match.chat_id, who)
             await context.bot.send_message(match.chat_id, f"❌ {who_m} — {TIMEOUT_MSG}", parse_mode=ParseMode.MARKDOWN)
 
-            # SOLO: hết giờ -> thua, kết thúc
             if match.solo_mode:
                 match.active = False
                 match.cancel_turn_tasks()
                 await context.bot.send_message(match.chat_id, "🏁 Ván solo kết thúc. Bot thắng 🤖")
                 return
 
-            # MULTI: loại player, chuyển lượt/trao cúp nếu còn 1
             if who in match.joined:
                 idx = match.joined.index(who)
                 match.joined.pop(idx)
@@ -235,46 +298,67 @@ async def schedule_turn_timers(update: Update, context: ContextTypes.DEFAULT_TYP
                 match.cancel_turn_tasks()
                 return
 
-            # chuyển lượt
             match.turn_idx = (match.turn_idx + 1) % len(match.joined)
             pick_next_idx(match)
             who2 = await mention_user(context, match.chat_id, match.current_player)
             await context.bot.send_message(
                 match.chat_id,
-                f"🟢 {who2} đến lượt. Gửi **cụm 2 từ** có nghĩa (đúng vần với cụm trước).",
+                f"🟢 {who2} đến lượt. Gửi **cụm 2 từ** đúng vần với cụm trước.",
                 parse_mode=ParseMode.MARKDOWN,
             )
             await schedule_turn_timers(update, context, match)
         except asyncio.CancelledError:
             pass
 
-    # chỉ đặt timer cho lượt người chơi (không đặt khi tới lượt “bot ảo”)
+    # chỉ đặt timer cho lượt người chơi
     if not match.solo_mode or (match.solo_mode and match.current_player is not None):
         loop = asyncio.get_running_loop()
         match.half_task = loop.create_task(half_warn())
         match.timeout_task = loop.create_task(timeout_kick())
 
-# ================== HANDLERS ==================
+# ============ HANDLERS ============
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Chào cả nhà! /newgame để mở sảnh, /join để tham gia.\n"
         f"Đủ 2 người, bot đếm ngược {AUTO_BEGIN_SECONDS}s rồi tự bắt đầu.\n"
-        f"Luật: đúng 2 từ, có trong từ điển, và **đối vần** (từ 1 của cụm mới phải cùng vần với từ 2 của cụm trước).\n"
-        f"Từ điển hiện có: {len(DICT)} cụm 2 từ."
+        "Luật: đúng 2 từ, có nghĩa (DICT/SLANG hoặc linh hoạt), và **đối vần**: từ 1 của cụm mới cùng vần với từ 2 của cụm trước.\n"
+        f"Từ điển: {len(DICT)} chuẩn + {len(SLANG)} slang."
     )
 
 async def cmd_reload(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global DICT
-    DICT = load_dict(DICT_FILE)
-    await update.message.reply_text(f"🔁 Đã nạp lại từ điển: {len(DICT)} cụm 2 từ.")
+    global DICT, SLANG
+    DICT = _load_dict_file(DICT_FILE)
+    SLANG = _load_dict_file(SLANG_FILE)
+    await update.message.reply_text(f"🔁 Nạp lại: DICT={len(DICT)} | SLANG={len(SLANG)}")
 
 async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("pong ✅")
 
+async def cmd_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("Dùng: /check <cụm 2 từ>")
+        return
+    phrase = " ".join(context.args)
+    form_ok, _ = is_two_word_form(phrase)
+    ok, norm, info = is_meaningful(phrase)
+    lines = []
+    lines.append(f"🧪 `{phrase}` → `{norm}`")
+    lines.append(f"• Âm tiết hợp lệ: {'✅' if form_ok else '❌'}")
+    lines.append(f"• Có nghĩa: {'✅' if ok else '❌'}")
+    src = info.get("source")
+    if ok:
+        lines.append(f"  ↳ Nguồn: {src or 'UNKNOWN'}")
+    else:
+        note = info.get("note")
+        if note == "form_invalid":
+            lines.append("  ↳ Lý do: ghép âm bất hợp pháp / không đúng 2 từ.")
+        elif note == "not_in_dict":
+            lines.append("  ↳ Không thấy trong DICT/SLANG và không qua ngưỡng tần suất.")
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+
 async def cmd_newgame(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     m = matches.get(chat_id) or Match(chat_id)
-    # reset
     m.lobby_open = True
     m.joined = []
     m.active = False
@@ -287,7 +371,6 @@ async def cmd_newgame(update: Update, context: ContextTypes.DEFAULT_TYPE):
     m.cancel_turn_tasks()
     m.cancel_auto_begin()
     matches[chat_id] = m
-
     await update.message.reply_text(
         f"🎮 Sảnh mở! /join để tham gia.\n"
         f"➡️ Khi **đủ 2 người**, bot sẽ đếm ngược {AUTO_BEGIN_SECONDS}s rồi tự bắt đầu."
@@ -307,7 +390,7 @@ async def cmd_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
     who = await mention_user(context, chat_id, user_id)
     await update.message.reply_text(f"➕ {who} đã tham gia!", parse_mode=ParseMode.MARKDOWN)
 
-    # Khi vừa đủ 2 người → bắt đầu đếm ngược 60s (dù sau đó có thêm người vẫn START đúng lịch)
+    # Vừa đủ 2 người → bắt đầu đếm ngược
     if len(m.joined) == 2 and m.auto_begin_task is None:
         async def auto_begin():
             try:
@@ -339,7 +422,7 @@ async def force_begin(update: Update, context: ContextTypes.DEFAULT_TYPE, m: Mat
         return
 
     if len(m.joined) == 1:
-        # ===== SOLO MODE =====
+        # SOLO
         m.solo_mode = True
         m.solo_warn_count = 0
         m.active = True
@@ -348,37 +431,31 @@ async def force_begin(update: Update, context: ContextTypes.DEFAULT_TYPE, m: Mat
         m.current_phrase = None
         await context.bot.send_message(
             m.chat_id,
-            "🤖 Chỉ có 1 người tham gia → chơi SOLO với bot.\n"
-            "📘 Luật: đúng 2 từ • có trong từ điển • **đối vần** (từ 1 của cụm mới phải cùng vần với từ 2 của cụm trước).\n"
-            "Sai sẽ được nhắc tối đa 3 lần.",
+            "🤖 Chỉ có 1 người tham gia → SOLO với bot.\n"
+            "📘 Luật: đúng 2 từ • có nghĩa (tục/GenZ linh hoạt) • **đối vần** (từ 1 = vần từ 2 cụm trước)."
         )
         who = await mention_user(context, m.chat_id, m.current_player)
         await context.bot.send_message(
-            m.chat_id,
-            f"👉 {who} đi trước. Gửi **cụm 2 từ** bất kỳ (lượt đầu tự do).",
-            parse_mode=ParseMode.MARKDOWN,
+            m.chat_id, f"👉 {who} đi trước. Lượt đầu tự do.", parse_mode=ParseMode.MARKDOWN
         )
         await schedule_turn_timers(update, context, m)
         return
 
-    # ===== MULTIPLAYER =====
+    # MULTI
     m.solo_mode = False
     m.active = True
     random.shuffle(m.joined)
     m.turn_idx = random.randrange(len(m.joined))
     m.current_player = m.joined[m.turn_idx]
     m.current_phrase = None
-
     await context.bot.send_message(
         m.chat_id,
         "🚀 Bắt đầu (multiplayer)! Sai luật hoặc hết giờ sẽ bị loại.\n"
-        "📘 Luật: đúng 2 từ • có trong từ điển • **đối vần** (từ 1 của cụm mới phải cùng vần với từ 2 của cụm trước).",
+        "📘 Luật: đúng 2 từ • có nghĩa (DICT/SLANG/linh hoạt) • **đối vần**."
     )
     who = await mention_user(context, m.chat_id, m.current_player)
     await context.bot.send_message(
-        m.chat_id,
-        f"👉 {who} đi trước. Gửi **cụm 2 từ** bất kỳ (lượt đầu tự do).",
-        parse_mode=ParseMode.MARKDOWN,
+        m.chat_id, f"👉 {who} đi trước. Lượt đầu tự do.", parse_mode=ParseMode.MARKDOWN
     )
     await schedule_turn_timers(update, context, m)
 
@@ -394,43 +471,50 @@ async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     m.cancel_auto_begin()
     await update.message.reply_text("⛔ Đã dừng ván hiện tại.")
 
-# ================== NHẬN CÂU TRẢ LỜI ==================
+# ============ NHẬN CÂU TRẢ LỜI ============
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
         return
     chat_id = update.effective_chat.id
     user_id = update.effective_user.id
-    text = " ".join(update.message.text.strip().lower().split())
-
+    raw = update.message.text
     m = matches.get(chat_id)
     if not m or not m.active:
-        return  # bỏ qua khi không chơi
-
-    # chỉ xét tin của người đang tới lượt (multiplayer) hoặc của người chơi (solo)
+        return
     if user_id != m.current_player:
         return
 
-    # 1) đúng 2 từ, có trong từ điển, chưa dùng
-    basic_ok = is_two_word_phrase_in_dict(text) and (text not in m.used_phrases)
-    # 2) đúng luật vần (trừ lượt đầu)
-    rhyme_ok = rhyme_match(m.current_phrase, text)
+    # 1) Kiểu 2 từ + âm tiết hợp lệ
+    form_ok, _ = is_two_word_form(raw)
+    # 2) Nghĩa (lai)
+    meaning_ok, normalized, info = is_meaningful(raw)
+    # 3) Chưa dùng
+    not_used = normalized not in m.used_phrases
+    # 4) Đối vần
+    rhyme_ok = rhyme_match(m.current_phrase, normalized)
 
-    if not (basic_ok and rhyme_ok):
+    valid = form_ok and meaning_ok and not_used and rhyme_ok
+
+    if not valid:
         if m.solo_mode:
-            # SOLO: nhắc tối đa 3 lần, không loại ngay
             if m.solo_warn_count < 3:
                 hint = SOLO_HINTS[m.solo_warn_count] if m.solo_warn_count < len(SOLO_HINTS) else SOLO_HINTS[-1]
                 m.solo_warn_count += 1
-                await update.message.reply_text(f"⚠️ {hint}")
+                # Gợi ý ngắn lý do
+                reasons = []
+                if not form_ok: reasons.append("ghép âm/không đúng 2 từ")
+                if not meaning_ok: reasons.append("không thấy nghĩa hợp lệ")
+                if not not_used: reasons.append("đã dùng rồi")
+                if not rhyme_ok: reasons.append("sai đối vần")
+                extra = f" ({', '.join(reasons)})" if reasons else ""
+                await update.message.reply_text(f"⚠️ {hint}{extra}")
                 return
             else:
-                # quá 3 nhắc -> thua
                 await update.message.reply_text("❌ Sai liên tiếp. Bot thắng 🤖")
                 m.active = False
                 m.cancel_turn_tasks()
                 return
         else:
-            # MULTI: loại ngay
             msg = random.choice(WRONG_ANSWERS)
             await update.message.reply_text(f"❌ {msg}")
             idx = m.joined.index(user_id)
@@ -444,7 +528,6 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 m.active = False
                 m.cancel_turn_tasks()
                 return
-            # chuyển lượt
             m.turn_idx = (m.turn_idx + 1) % len(m.joined)
             m.current_player = m.joined[m.turn_idx]
             who2 = await mention_user(context, chat_id, m.current_player)
@@ -456,25 +539,17 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
     # ===== HỢP LỆ =====
+    text = normalized
     m.used_phrases.add(text)
     m.current_phrase = text
 
     if m.solo_mode:
-        # Reset bộ đếm cảnh báo cho lượt kế
         m.solo_warn_count = 0
-        await update.message.reply_text("✅ Hợp lệ. Tới lượt bot 🤖")
-        # Huỷ timer vì bot trả ngay
+        await update.message.reply_text(f"✅ Hợp lệ ({info.get('source') or 'OK'}). Tới lượt bot 🤖")
         m.cancel_turn_tasks()
 
         bot_pick = random_bot_phrase(m)
-        if not bot_pick:
-            await context.bot.send_message(chat_id, "🤖 Bot hết chữ rồi… Bạn thắng! 🏆")
-            m.active = False
-            return
-
-        # Kiểm tra bot có tuân luật vần không (phải đúng theo cụm của bạn vừa nói)
-        if not rhyme_match(m.current_phrase, bot_pick):
-            # nếu hiếm khi không tìm được cụm hợp vần: bot chịu thua
+        if not bot_pick or not rhyme_match(m.current_phrase, bot_pick):
             await context.bot.send_message(chat_id, "🤖 Hết chữ hợp vần… Bạn thắng! 🏆")
             m.active = False
             return
@@ -483,13 +558,11 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         m.current_phrase = bot_pick
         await context.bot.send_message(chat_id, f"🤖 Bot: **{bot_pick}**", parse_mode=ParseMode.MARKDOWN)
 
-        # Trả lượt lại cho người chơi + đặt lại đồng hồ
         await context.bot.send_message(chat_id, "👉 Tới lượt bạn. Gửi **cụm 2 từ** đúng vần.")
         await schedule_turn_timers(update, context, m)
         return
 
-    # MULTIPLAYER: chuyển lượt bình thường
-    await update.message.reply_text("✅ Hợp lệ. Tới lượt kế tiếp!")
+    await update.message.reply_text(f"✅ Hợp lệ ({info.get('source') or 'OK'}). Tới lượt kế tiếp!")
     m.turn_idx = (m.turn_idx + 1) % len(m.joined)
     m.current_player = m.joined[m.turn_idx]
     who2 = await mention_user(context, chat_id, m.current_player)
@@ -499,7 +572,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await schedule_turn_timers(update, context, m)
 
-# ================== TẠO APP ==================
+# ============ APP ============
 def build_app() -> Application:
     token = os.getenv("TELEGRAM_TOKEN", "").strip()
     if not token:
@@ -508,6 +581,7 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("ping", cmd_ping))
     app.add_handler(CommandHandler("reload", cmd_reload))
+    app.add_handler(CommandHandler("check", cmd_check))
     app.add_handler(CommandHandler("newgame", cmd_newgame))
     app.add_handler(CommandHandler("join", cmd_join))
     app.add_handler(CommandHandler("begin", cmd_begin))
