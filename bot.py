@@ -1,408 +1,434 @@
-# bot.py
-import os, random, re, asyncio
-from collections import defaultdict, deque
-from typing import List, Set, Dict, Optional, Tuple
+# bot.py — Đối chữ "cụm 2 từ có nghĩa" + /iu tỏ tình (PTB 21.x, webhook)
+# - /newgame hoặc /batdau mở sảnh, đếm ngược AUTO_LOBBY giây
+# - 0 join: hủy, 1 join: chơi với bot, >=2: bot làm trọng tài
+# - Mỗi lượt ROUND_SECONDS (nhắc ở HALF_TIME)
+# - Cụm sau phải bắt đầu bằng từ thứ 2 của cụm trước (khớp không dấu)
+# - Nghĩa: có trong dict_vi.txt / slang_vi.txt (có/không dấu) hoặc zipf>=GENZ_ZIPF (wordfreq)
+# - /iu: chỉ @yhck2 gọi; @xiaoc6789 bấm nút nào cũng “Em đồng ý !! Yêu Anh 🥰”, người khác “Thiệu ơi !! Yêu Anh Nam Đii”
+# - Tương thích webhook.py: build_app() trả một wrapper có initialize/start/stop/shutdown/process_update
 
-from telegram import Update, ChatPermissions
-from telegram.ext import (
-    ApplicationBuilder, AIORateLimiter,
-    CommandHandler, MessageHandler, filters, ContextTypes
-)
+import os, re, json, random, asyncio
+from typing import Dict, List, Set, Optional, Tuple
+from datetime import datetime
+
 from unidecode import unidecode
 
-# ========= Cấu hình qua ENV =========
-ROUND_SECONDS  = int(os.getenv("ROUND_SECONDS", "60"))
-HALF_WARN      = int(os.getenv("HALF_WARN", "30"))
-DICT_FILE      = os.getenv("DICT_FILE", "dict_vi.txt")       # bộ cụm 2 từ (bạn đã có)
-VERBS_FILE     = os.getenv("VERBS_FILE", "verbs_vi.txt")     # list động từ (bổ sung)
-BOT_TOKEN      = os.getenv("TELEGRAM_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")
+try:
+    from wordfreq import zipf_frequency
+except Exception:
+    zipf_frequency = None
 
+from telegram import (
+    Update, InlineKeyboardButton, InlineKeyboardMarkup, Message,
+)
+from telegram.constants import ParseMode
+from telegram.ext import (
+    Application, ApplicationBuilder, CommandHandler, MessageHandler,
+    CallbackQueryHandler, ContextTypes, filters,
+)
+
+# =========================
+# ENV / CONFIG
+# =========================
+BOT_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
 if not BOT_TOKEN:
     raise RuntimeError("Thiếu TELEGRAM_TOKEN")
 
-# ========= Tải từ điển =========
-def norm_text(s: str) -> str:
-    # chuẩn hoá để so trùng (không bỏ dấu bản gốc khi hiển thị)
+ROUND_SECONDS = int(os.getenv("ROUND_SECONDS", "60"))
+HALF_TIME     = int(os.getenv("HALF_TIME", "30"))
+AUTO_LOBBY    = int(os.getenv("AUTO_LOBBY", "60"))
+
+DICT_FILE  = os.getenv("DICT_VI",  "dict_vi.txt")
+SLANG_FILE = os.getenv("SLANG_VI", "slang_vi.txt")
+GENZ_ZIPF  = float(os.getenv("GENZ_ZIPF", "2.2"))
+
+SPECIAL_CALLER   = os.getenv("IU_CALLER", "@yhck2").lower()
+SPECIAL_ACCEPTOR = os.getenv("IU_ACCEPTOR", "@xiaoc6789").lower()
+
+# =========================
+# HELPERS (normalize + dict)
+# =========================
+def _norm(s: str) -> str:
     s = (s or "").strip().lower()
-    s = re.sub(r"\s+", " ", s)
-    return s
+    return re.sub(r"\s+", " ", s)
 
-def key_no_tone(s: str) -> str:
-    s = norm_text(s)
-    s = unidecode(s)
-    s = re.sub(r"[^a-z0-9\s]", " ", s)
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
+def _norm_nodiac(s: str) -> str:
+    return _norm(unidecode(s))
 
-def load_lines(path: str) -> List[str]:
-    if not os.path.exists(path): return []
-    out = []
+def load_list(path: str) -> Set[str]:
+    bag: Set[str] = set()
+    if not os.path.exists(path):
+        return bag
     with open(path, "r", encoding="utf-8") as f:
         for line in f:
-            t = line.strip()
-            if t:
-                out.append(t)
-    return out
+            t = _norm(line)
+            if not t: 
+                continue
+            bag.add(t)                 # có dấu
+            bag.add(_norm_nodiac(t))   # thêm bản không dấu
+    return bag
 
-# dict cụm 2 từ
-RAW_PHRASES: List[str] = load_lines(DICT_FILE)
-PHRASES_SET: Set[str] = set(key_no_tone(x) for x in RAW_PHRASES)
+DICT_SET  = load_list(DICT_FILE)
+SLANG_SET = load_list(SLANG_FILE)
 
-# verbs
-RAW_VERBS: List[str] = load_lines(VERBS_FILE)
-VERBS_SET: Set[str] = set(key_no_tone(x) for x in RAW_VERBS)
-
-def split2(s: str) -> Optional[Tuple[str, str]]:
-    t = norm_text(s)
-    parts = t.split(" ")
-    if len(parts) != 2: return None
-    return parts[0], parts[1]
-
-def is_action_phrase(text: str) -> bool:
-    """Hợp lệ nếu:
-       - đúng 2 từ
-       - (a) cả cụm có trong DICT_FILE (khuyến nghị bạn chỉ giữ cụm động từ), hoặc
-       - (b) từ1 ∈ verbs & từ2 ∈ verbs (xem như cụm hành động)
-    """
-    pair = split2(text)
-    if not pair: return False
-    a, b = pair
-    # a+b trong dict cụm 2 từ?
-    if key_no_tone(f"{a} {b}") in PHRASES_SET:
+def is_meaningful_token(tok: str) -> bool:
+    if not tok or len(tok) < 2:
+        return False
+    t1 = _norm(tok)
+    t0 = _norm_nodiac(tok)
+    if t1 in DICT_SET or t0 in DICT_SET:
         return True
-    # fallback: cả 2 đều là động từ
-    return (key_no_tone(a) in VERBS_SET) and (key_no_tone(b) in VERBS_SET)
+    if t1 in SLANG_SET or t0 in SLANG_SET:
+        return True
+    if zipf_frequency:
+        try:
+            if zipf_frequency(t1, "vi") >= GENZ_ZIPF:
+                return True
+            if t0 != t1 and zipf_frequency(t0, "vi") >= GENZ_ZIPF:
+                return True
+        except Exception:
+            pass
+    return False
 
-# ========= Trạng thái game theo chat =========
-class GameState:
+def is_valid_two_word_phrase(text: str) -> Tuple[bool, str, List[str]]:
+    t = _norm(text)
+    toks = t.split()
+    if len(toks) != 2:
+        return False, "❌ Phải gửi **cụm 2 từ**.", []
+    bad = [w for w in toks if not is_meaningful_token(w)]
+    if bad:
+        return False, f"❌ Từ **{bad[0]}** nghe không có nghĩa (hoặc hiếm quá).", []
+    return True, "", toks
+
+def link_rule_ok(prev_tokens: List[str], new_tokens: List[str]) -> Tuple[bool, str]:
+    if not prev_tokens:
+        return True, ""
+    need = _norm_nodiac(prev_tokens[1])
+    got  = _norm_nodiac(new_tokens[0])
+    if need != got:
+        return False, f"❌ Sai luật nối chữ: phải bắt đầu bằng **{prev_tokens[1]} …**"
+    return True, ""
+
+def pick_meaningful_word(exclude_first: str, used: Set[str]) -> Optional[str]:
+    pool = [w for w in DICT_SET if " " not in w and len(w) >= 2]
+    pool += [w for w in SLANG_SET if " " not in w and len(w) >= 2]
+    random.shuffle(pool)
+    for cand in pool:
+        if _norm_nodiac(cand) == _norm_nodiac(exclude_first):
+            continue
+        phrase = f"{exclude_first} {cand}"
+        if _norm(phrase) not in used:
+            return cand
+    if zipf_frequency:
+        commons = ["đẹp","lên","xuống","mạnh","nhanh","vội","đã","nữa","liền","ngay"]
+        random.shuffle(commons)
+        for cand in commons:
+            if _norm(f"{exclude_first} {cand}") not in used:
+                return cand
+    return None
+
+# =========================
+# MESSAGES
+# =========================
+LOBBY_TEXT = (
+    "Chào nhóm!\n"
+    "Gõ /join để tham gia. Sau {sec}s nếu:\n"
+    "• 0 người: ❌ Hủy ván\n"
+    "• 1 người: 🤖 Bạn chơi với bot\n"
+    "• 2+ người: 👑 Bot làm trọng tài\n\n"
+    "📘 Luật:\n"
+    "• Gửi **cụm 2 từ**\n"
+    "• Mỗi từ phải **có nghĩa** (từ điển/slang hoặc phổ dụng)\n"
+    "• Cụm sau **bắt đầu bằng đuôi** của cụm trước (VD: “con heo” → “**heo** nái”)\n"
+    "• Sai luật/hết giờ → loại."
+)
+
+REMINDERS = [
+    "Nhanh nhanh lên bạn ơi, thời gian không chờ ai đâu!",
+    "Có đoán được không? Chậm thế!",
+    "IQ chỉ đến thế thôi sao? Nhanh cái não lên!",
+    "Suy nghĩ gì nữa!!! Đoán đêeee!",
+    "Vẫn chưa có kết quả sao?? Não 🐷 à!!!",
+    "Tỉnh táo lên nào, cơ hội đang trôi kìa!",
+    "Bình tĩnh nhưng đừng *từ tốn* quá bạn ơi!",
+    "Đếm ngược rồi đó, làm phát chất lượng đi!",
+    "Đố mẹo chứ đâu phải đố đời đâu 🤭",
+    "Thời gian là vàng, còn bạn là... bạc phếch!",
+    "Gợi ý nằm trong bốn chữ: **cụm hai từ**!",
+]
+
+OK_CHEERS = [
+    "✅ Thôi được, công nhận bạn không gà lắm!",
+    "✅ Quá ghê, xin nhận một cú cúi đầu!",
+    "✅ Chuẩn bài, khỏi bàn!",
+    "✅ Đỉnh của chóp!",
+]
+
+TIME_WARNINGS = [
+    "⏰ Cú lừa à? Không, chỉ còn **ít thời gian** thôi!",
+    "⏰ Nhanh lên, nửa thời gian đã trôi!",
+]
+
+WRONG_FMT = [
+    "❌ Không đúng. Còn {left} lần 'trật lất' nữa!",
+    "❌ Sai rồi. Còn {left} cơ hội!",
+    "❌ No no. Còn {left} lần!",
+    "❌ Trượt. {left} lần còn lại!",
+]
+
+# =========================
+# GAME STATE
+# =========================
+class Game:
     def __init__(self, chat_id: int):
         self.chat_id = chat_id
-        self.is_lobby_open = False
+        self.lobby_open = False
         self.players: List[int] = []
-        self.player_names: Dict[int, str] = {}
-        self.turn_idx = 0
-        self.vs_bot = False
+        self.single_vs_bot = False
+
         self.active = False
-        self.last_phrase: Optional[str] = None
-        self.used_keys: Set[str] = set()
-        self.countdown_job = None
-        self.reminder_job = None
-        self.round_timeout_job = None
-        self.guess_left: Dict[int, int] = defaultdict(lambda: 1)  # mỗi người 1 lượt tại một thời điểm
-        self.current_player: Optional[int] = None
+        self.prev_tokens: List[str] = []
+        self.used: Set[str] = set()
+        self.mistakes_left: int = 3
+        self.job_ids: List[str] = []
 
-    def reset_round(self):
-        self.turn_idx = 0
-        self.active = False
-        self.last_phrase = None
-        self.used_keys.clear()
-        self.current_player = None
+    def clear_jobs(self, context: ContextTypes.DEFAULT_TYPE):
+        for jid in list(self.job_ids):
+            for j in context.job_queue.get_jobs_by_name(jid):
+                j.schedule_removal()
+            self.job_ids.clear()
 
-    def next_player(self):
-        if not self.players: return None
-        self.turn_idx = (self.turn_idx + 1) % len(self.players)
-        self.current_player = self.players[self.turn_idx]
-        return self.current_player
+GAMES: Dict[int, Game] = {}
 
-    def current_player_id(self):
-        return self.current_player
+def get_game(chat_id: int) -> Game:
+    if chat_id not in GAMES:
+        GAMES[chat_id] = Game(chat_id)
+    return GAMES[chat_id]
 
-# tất cả chat
-GAMES: Dict[int, GameState] = {}
+# =========================
+# APP FACTORY
+# =========================
+def make_application() -> Application:
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    app.add_handler(CommandHandler(["start"], cmd_start))
+    app.add_handler(CommandHandler(["newgame","batdau"], cmd_newgame))
+    app.add_handler(CommandHandler(["join"], cmd_join))
+    app.add_handler(CommandHandler(["ketthuc"], cmd_stop))
+    app.add_handler(CommandHandler(["iu"], cmd_iu))
+    app.add_handler(CallbackQueryHandler(cb_iu_buttons, pattern=r"^iu:(yes|no)$"))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+    return app
 
-# ========= Countdown / nhắc giờ =========
-async def start_countdown(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
-    game = GAMES[chat_id]
-    # nhắc mốc 60, 30, 10
-    await context.bot.send_message(chat_id, f"🎮 Sảnh mở! /join để tham gia. **{ROUND_SECONDS}s** nữa vào trận.")
-    # nửa thời gian
-    await asyncio.sleep(max(0, ROUND_SECONDS - HALF_WARN))
-    if game.is_lobby_open:
-        await context.bot.send_message(chat_id, f"⏳ Còn **{HALF_WARN}s** nữa.")
-    # 10s cuối
-    remain = ROUND_SECONDS - (ROUND_SECONDS - HALF_WARN) - 20
-    if remain > 0: await asyncio.sleep(remain)
-    if game.is_lobby_open:
-        await context.bot.send_message(chat_id, "⏳ **Còn 20s** nữa…")
-    await asyncio.sleep(10)
-    if game.is_lobby_open:
-        await context.bot.send_message(chat_id, "⏳ **Còn 10s** nữa…")
-    await asyncio.sleep(10)
-    # Hết countdown → bắt đầu nếu đủ người
-    if not game.is_lobby_open: 
-        return
-    if len(game.players) == 0:
-        await context.bot.send_message(chat_id, "❌ Không ai tham gia. Hủy sảnh.")
-        game.is_lobby_open = False
-        return
-    # quyết định chế độ
-    if len(game.players) == 1:
-        game.vs_bot = True
-        await context.bot.send_message(
-            chat_id,
-            f"🤖 Chỉ có 1 người tham gia. Bắt đầu **đấu với bot**!"
-        )
-    else:
-        game.vs_bot = False
-        await context.bot.send_message(
-            chat_id,
-            f"👥 Có {len(game.players)} người. Bắt đầu! Bot sẽ làm trọng tài."
-        )
-    game.is_lobby_open = False
-    await begin_round(context, chat_id)
-
-async def begin_round(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
-    game = GAMES[chat_id]
-    game.reset_round()
-    if not game.players:
-        await context.bot.send_message(chat_id, "❌ Không có người chơi.")
-        return
-
-    # chọn người đi đầu
-    game.current_player = game.players[game.turn_idx]
-    name = game.player_names.get(game.current_player, "người chơi")
-
-    # tạo cụm mở đầu (để người chơi đối) – chọn ngẫu nhiên từ DICT_FILE (ưu tiên cụm trong dict)
-    if RAW_PHRASES:
-        seed = random.choice(RAW_PHRASES)
-    else:
-        # fallback nếu bạn chưa có dict cụm, chọn 2 verbs ngẫu nhiên cho đúng luật
-        if len(RAW_VERBS) < 2:
-            await context.bot.send_message(chat_id, "⚠️ Chưa có dữ liệu từ điển.")
-            return
-        seed = f"{random.choice(RAW_VERBS)} {random.choice(RAW_VERBS)}"
-
-    game.last_phrase = seed
-    game.used_keys.add(key_no_tone(seed))
-
-    await context.bot.send_message(
-        chat_id,
-        f"🎯 Cụm mở đầu: **{seed}**\n"
-        f"👉 {name} đi trước. Gửi cụm **2 từ** (hành động) sao cho **từ đầu** trùng **từ cuối** của cụm trước."
-    )
-
-    # set timer cho lượt đầu
-    await set_turn_timers(context, chat_id)
-
-async def set_turn_timers(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
-    game = GAMES.get(chat_id)
-    if not game: return
-    # nhắc 30s
-    async def half_warn_cb(ctx: ContextTypes.DEFAULT_TYPE):
-        await ctx.bot.send_message(chat_id, random.choice(HALF_WARN_LINES))
-
-    async def timeup_cb(ctx: ContextTypes.DEFAULT_TYPE):
-        await on_timeout(ctx, chat_id)
-
-    # chạy song song 2 job “ngủ”
-    asyncio.create_task(_sleep_and_call(HALF_WARN, context, half_warn_cb))
-    asyncio.create_task(_sleep_and_call(ROUND_SECONDS, context, timeup_cb))
-
-async def _sleep_and_call(seconds: int, context, coro_func):
-    await asyncio.sleep(seconds)
-    try:
-        await coro_func(context)
-    except Exception:
-        pass
-
-async def on_timeout(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
-    game = GAMES.get(chat_id)
-    if not game or not game.current_player: return
-    name = game.player_names.get(game.current_player, "người chơi")
-    await context.bot.send_message(chat_id, random.choice(TIMEOUT_LINES).format(name=name))
-    # loại người chơi
-    await eliminate_or_next(context, chat_id, wrong=True)
-
-async def eliminate_or_next(context: ContextTypes.DEFAULT_TYPE, chat_id: int, wrong: bool):
-    game = GAMES.get(chat_id)
-    if not game: return
-    if wrong:
-        # loại player hiện tại
-        pid = game.current_player
-        if pid in game.players:
-            game.players.remove(pid)
-        await context.bot.send_message(chat_id, f"❌ {game.player_names.get(pid,'người chơi')} bị loại.")
-        if len(game.players) == 0:
-            await context.bot.send_message(chat_id, "🏁 Trò chơi kết thúc – không còn ai.")
-            return
-        # căn lại turn_idx để không nhảy quá
-        game.turn_idx = game.turn_idx % len(game.players)
-
-    # nếu chỉ còn 1 người và đang ở chế độ trọng tài → người đó thắng
-    if not game.vs_bot and len(game.players) == 1:
-        winner = game.players[0]
-        await context.bot.send_message(chat_id, f"👑 {game.player_names.get(winner,'người chơi')} thắng cuộc!")
-        return
-
-    # qua người tiếp theo
-    game.current_player = game.players[game.turn_idx]
-    await context.bot.send_message(chat_id, f"👉 Đến lượt {game.player_names.get(game.current_player,'người chơi')}.")
-
-    # set timer mới cho lượt kế
-    await set_turn_timers(context, chat_id)
-
-# ========= Bot đánh nếu 1v1 =========
-def find_reply(last_phrase: str) -> Optional[str]:
-    """Tìm cụm đáp ứng luật: từ1 == last_word(last_phrase)"""
-    pair = split2(last_phrase)
-    if not pair: return None
-    last_w = pair[1]
-    target_key = key_no_tone(last_w)
-
-    candidates: List[str] = []
-    # ưu tiên cụm trong PHRASES_SET bắt đầu bằng last_w
-    for p in RAW_PHRASES:
-        sp = split2(p)
-        if not sp: continue
-        if key_no_tone(sp[0]) == target_key:
-            candidates.append(p)
-    # fallback: ghép 2 verbs
-    if not candidates and RAW_VERBS:
-        for v in RAW_VERBS:
-            if key_no_tone(v) == target_key:
-                # ghép với một verb khác
-                tail = random.choice(RAW_VERBS)
-                candidates.append(f"{v} {tail}")
-
-    return random.choice(candidates) if candidates else None
-
-# ========= Câu nhắc =========
-HALF_WARN_LINES = [
-    "⏳ Nhanh lên bạn ơi, thời gian không chờ ai cả!",
-    "⏳ Chậm thế? Mau đoán đi chứ!",
-    "⏳ IQ chỉ thế thôi sao? Nhanh cái não lên!",
-    "⏳ Suy nghĩ gì nữa! Gửi luôn đi!",
-    "⏳ Vẫn chưa có kết quả sao?",
-    "⏳ Đừng để hết giờ oan nhé!",
-    "⏳ Cố lên, cụm 2 từ hành động thôi mà!",
-    "⏳ Đếm ngược đấy, lẹ nào!",
-    "⏳ Gợi ý: từ đầu phải là từ cuối của cụm trước!",
-    "⏳ Hơi bị chậm rồi đó!",
-]
-TIMEOUT_LINES = [
-    "⏰ Hết giờ cho {name}!",
-    "⏰ {name} đứng hình 5s… và hết giờ!",
-    "⏰ {name} quá chậm, xin chào tạm biệt!",
-]
-
-# ========= Handlers =========
+# =========================
+# COMMANDS
+# =========================
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Chào nhóm! /newgame để mở sảnh, /join để vào, /stop để dừng.\n"
-        f"Luật: đối chữ **2 từ** (cụm **động từ** có nghĩa). Câu sau phải bắt đầu bằng **từ cuối** của câu trước.\n"
-        f"Đếm ngược: {ROUND_SECONDS}s, nhắc ở {HALF_WARN}s."
+    await update.effective_message.reply_text(
+        f"Chào nhóm! /newgame hoặc /batdau để mở sảnh, /join để tham gia, /ketthuc để dừng.\n"
+        f"⏱️ Mỗi lượt {ROUND_SECONDS}s (nhắc ở {HALF_TIME}s).\n"
+        f"Từ điển: ~{len(DICT_SET)//2} mục, slang: ~{len(SLANG_SET)//2} mục."
     )
 
 async def cmd_newgame(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    game = GAMES.get(chat_id) or GameState(chat_id)
-    GAMES[chat_id] = game
+    g = get_game(chat_id)
+    g.lobby_open = True
+    g.players = []
+    g.active = False
+    g.single_vs_bot = False
+    g.prev_tokens = []
+    g.used = set()
+    g.mistakes_left = 3
+    g.clear_jobs(context)
 
-    if game.is_lobby_open:
-        await update.message.reply_text("Sảnh đang mở rồi, /join đi bạn ơi!")
-        return
-    if game.active:
-        await update.message.reply_text("Đang có trận, /stop nếu muốn dừng.")
-        return
+    await update.effective_message.reply_text(LOBBY_TEXT.format(sec=AUTO_LOBBY), parse_mode=ParseMode.MARKDOWN)
 
-    # mở sảnh & countdown
-    game.is_lobby_open = True
-    game.players = []
-    game.player_names = {}
-    game.vs_bot = False
-    await update.message.reply_text("🎮 Sảnh mở! /join để tham gia. Sẽ bắt đầu sau 60s.")
-    asyncio.create_task(start_countdown(context, chat_id))
+    jid = f"lobby:{chat_id}:{datetime.now().timestamp()}"
+    g.job_ids.append(jid)
+    context.job_queue.run_once(close_lobby, AUTO_LOBBY, chat_id=chat_id, name=jid)
 
 async def cmd_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    user = update.effective_user
-    game = GAMES.get(chat_id)
-    if not game or not game.is_lobby_open:
-        await update.message.reply_text("Chưa mở sảnh. Dùng /newgame nhé.")
+    g = get_game(chat_id)
+    u = update.effective_user
+    if not g.lobby_open:
+        await update.effective_message.reply_text("Không có sảnh mở. Dùng /newgame trước.")
         return
-    if user.id in game.players:
-        await update.message.reply_text("Bạn đã tham gia rồi.")
+    if u.id in g.players:
+        await update.effective_message.reply_text("Bạn đã /join rồi!")
         return
-    game.players.append(user.id)
-    game.player_names[user.id] = (user.full_name or f"user_{user.id}")
-    await update.message.reply_text(f"✅ {user.full_name} đã vào. Hiện có {len(game.players)} người.")
+    g.players.append(u.id)
+    await update.effective_message.reply_html(f"✅ {u.mention_html()} đã tham gia!")
+
+async def close_lobby(context: ContextTypes.DEFAULT_TYPE):
+    chat_id = context.job.chat_id
+    g = get_game(chat_id)
+    g.lobby_open = False
+    n = len(g.players)
+    if n == 0:
+        await context.bot.send_message(chat_id, "⛔ Không ai tham gia. Hủy ván.")
+        return
+    if n == 1:
+        g.single_vs_bot = True
+        await context.bot.send_message(chat_id, "🤖 Chỉ có 1 người. Bạn sẽ chơi với bot!")
+    else:
+        g.single_vs_bot = False
+        await context.bot.send_message(chat_id, f"👥 Có {n} người. Bắt đầu thôi!")
+
+    await start_round(chat_id, context)
+
+async def start_round(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
+    g = get_game(chat_id)
+    g.active = True
+    g.prev_tokens = []
+    g.used = set()
+    g.mistakes_left = 3
+    g.clear_jobs(context)
+
+    await context.bot.send_message(
+        chat_id,
+        "🚀 Bắt đầu! Gửi **cụm 2 từ có nghĩa**. Sai luật/hết giờ → loại.",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+    schedule_timers(chat_id, context)
+
+def schedule_timers(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
+    g = get_game(chat_id)
+    g.clear_jobs(context)
+
+    jid1 = f"half:{chat_id}:{datetime.now().timestamp()}"
+    g.job_ids.append(jid1)
+    context.job_queue.run_once(half_warn, HALF_TIME, chat_id=chat_id, name=jid1)
+
+    jid2 = f"end:{chat_id}:{datetime.now().timestamp()}"
+    g.job_ids.append(jid2)
+    context.job_queue.run_once(timeup, ROUND_SECONDS, chat_id=chat_id, name=jid2)
+
+async def half_warn(context: ContextTypes.DEFAULT_TYPE):
+    chat_id = context.job.chat_id
+    await context.bot.send_message(chat_id, random.choice(TIME_WARNINGS))
+    await context.bot.send_message(chat_id, "💡 " + random.choice(REMINDERS))
+
+async def timeup(context: ContextTypes.DEFAULT_TYPE):
+    chat_id = context.job.chat_id
+    g = get_game(chat_id)
+    if not g.active:
+        return
+    g.active = False
+    await context.bot.send_message(chat_id, "⏳ Hết giờ! Ván dừng ở đây.")
 
 async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    game = GAMES.get(chat_id)
-    if not game:
-        await update.message.reply_text("Chưa có trận nào.")
-        return
-    GAMES.pop(chat_id, None)
-    await update.message.reply_text("🛑 Đã dừng trận hiện tại.")
+    g = get_game(chat_id)
+    g.active = False
+    g.lobby_open = False
+    g.clear_jobs(context)
+    await update.effective_message.reply_text("🛑 Đã kết thúc ván.")
 
-# kiểm tra câu trả lời
-async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message or not update.message.text: return
+# =========================
+# /iu — tỏ tình
+# =========================
+async def cmd_iu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    game = GAMES.get(chat_id)
-    if not game or game.is_lobby_open or game.current_player is None:
-        return
-
     user = update.effective_user
-    if user.id != game.current_player:
-        return  # không phải lượt của bạn
+    username = ("@" + (user.username or "")).lower()
+    if username != SPECIAL_CALLER:
+        return
+    kb = InlineKeyboardMarkup(
+        [[InlineKeyboardButton("Đồng ý 💚", callback_data="iu:yes"),
+          InlineKeyboardButton("Không 💔", callback_data="iu:no")]]
+    )
+    await context.bot.send_message(chat_id, "Yêu Em Thiệu 🥰 Làm Người Yêu Anh Nhé !!!", reply_markup=kb)
 
-    text = norm_text(update.message.text)
-    if not split2(text):
-        await update.message.reply_text("❌ Phải là **cụm 2 từ**.")
+async def cb_iu_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if not q:
+        return
+    await q.answer()
+    chat_id = q.message.chat_id
+    user = q.from_user
+    username = ("@" + (user.username or "")).lower()
+    text = "Em đồng ý !! Yêu Anh 🥰" if username == SPECIAL_ACCEPTOR else "Thiệu ơi !! Yêu Anh Nam Đii"
+    await q.message.reply_text(text)
+
+# =========================
+# NHẬN CÂU TRẢ LỜI
+# =========================
+async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    g = get_game(chat_id)
+    if not g.active:
         return
 
-    # luật xâu: từ đầu phải trùng từ cuối trước
-    last_a, last_b = split2(game.last_phrase)
-    now_a, now_b = split2(text)
-    if key_no_tone(now_a) != key_no_tone(last_b):
-        await update.message.reply_text("❌ Sai luật: từ đầu phải trùng **từ cuối** cụm trước.")
+    msg: Message = update.effective_message
+    text = msg.text or ""
+
+    ok, err, toks = is_valid_two_word_phrase(text)
+    if not ok:
+        await msg.reply_text(err, parse_mode=ParseMode.MARKDOWN)
+        g.mistakes_left -= 1
+        if g.mistakes_left <= 0:
+            await msg.reply_text("❌ Hết cơ hội cho cả nhóm. Ván dừng.")
+            g.active = False
         return
 
-    # không lặp
-    if key_no_tone(text) in game.used_keys:
-        await update.message.reply_text("❌ Cụm này đã dùng trong vòng này.")
+    ok2, err2 = link_rule_ok(g.prev_tokens, toks)
+    if not ok2:
+        await msg.reply_text(err2)
+        g.mistakes_left -= 1
+        if g.mistakes_left <= 0:
+            await msg.reply_text("❌ Hết cơ hội cho cả nhóm. Ván dừng.")
+            g.active = False
         return
 
-    # kiểm tra “cụm hành động”
-    if not is_action_phrase(text):
-        await update.message.reply_text("❌ Không phải **cụm động từ** có nghĩa.")
+    key = _norm(" ".join(toks))
+    if key in g.used:
+        await msg.reply_text("⚠️ Cụm này dùng rồi, thử cái khác!")
         return
 
-    # hợp lệ!
-    game.last_phrase = text
-    game.used_keys.add(key_no_tone(text))
-    await update.message.reply_text(f"✅ Hợp lệ: **{text}**")
+    # chấp nhận
+    g.used.add(key)
+    g.prev_tokens = toks
+    await msg.reply_text(random.choice(OK_CHEERS))
 
-    if game.vs_bot:
-        # bot đánh
-        await asyncio.sleep(0.8)
-        bot_reply = find_reply(game.last_phrase)
-        if not bot_reply or key_no_tone(bot_reply) in game.used_keys:
-            await context.bot.send_message(chat_id, "🤖 Thua rồi… bạn giỏi quá! 🏆")
+    # Chế độ 1 người → bot đối lại
+    if g.single_vs_bot:
+        tail = toks[1]
+        cand2 = pick_meaningful_word(tail, g.used)
+        if not cand2:
+            await context.bot.send_message(chat_id, "🤖 Bot bí rồi… bạn thắng!")
+            g.active = False
             return
-        game.last_phrase = bot_reply
-        game.used_keys.add(key_no_tone(bot_reply))
-        await context.bot.send_message(chat_id, f"🤖 Bot: **{bot_reply}**")
-        # tới lượt người chơi lại
-        await set_turn_timers(context, chat_id)
-    else:
-        # chuyển lượt sang người kế
-        game.next_player()
-        await set_turn_timers(context, chat_id)
+        bot_phrase = f"{tail} {cand2}"
+        okb, _, toksb = is_valid_two_word_phrase(bot_phrase)
+        if not okb:
+            await context.bot.send_message(chat_id, "🤖 Bot bí rồi… bạn thắng!")
+            g.active = False
+            return
+        g.used.add(_norm(bot_phrase))
+        g.prev_tokens = toksb
+        await context.bot.send_message(chat_id, f"🤖 {bot_phrase}")
 
-# ========= Build App =========
+    # Reset timers cho lượt kế tiếp
+    schedule_timers(chat_id, context)
+
+# =========================
+# WRAPPER cho webhook.py
+# =========================
+class TGAppWrapper:
+    def __init__(self):
+        self.app = make_application()
+    async def initialize(self):
+        await self.app.initialize()
+    async def start(self):
+        await self.app.start()
+    async def stop(self):
+        await self.app.stop()
+    async def shutdown(self):
+        await self.app.shutdown()
+    async def process_update(self, update: Update):
+        await self.app.process_update(update)
+
 def build_app():
-    app = ApplicationBuilder().token(BOT_TOKEN).rate_limiter(AIORateLimiter()).build()
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("newgame", cmd_newgame))
-    app.add_handler(CommandHandler("join", cmd_join))
-    app.add_handler(CommandHandler("stop", cmd_stop))
-    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), on_message))
-    return app
-
-# local run
-if __name__ == "__main__":
-    app = build_app()
-    app.run_polling(close_loop=False)
+    # webhook.py sẽ import hàm này
+    return TGAppWrapper()
