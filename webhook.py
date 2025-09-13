@@ -7,12 +7,12 @@ app = FastAPI()
 tg_app = build_app()
 
 @app.on_event("startup")
-async def _startup():
+async def startup():
     await tg_app.initialize()
     await tg_app.start()
 
 @app.on_event("shutdown")
-async def _shutdown():
+async def shutdown():
     await tg_app.stop()
     await tg_app.shutdown()
 
