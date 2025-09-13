@@ -1,28 +1,38 @@
 # webhook.py
+import os
 from fastapi import FastAPI, Request
 from telegram import Update
-from bot import build_app, initialize, stop
+from telegram.ext import Application, ApplicationBuilder
 
-app = FastAPI(title="Multi-Game Telegram Bot")
-tg_app = build_app()
+from bot import register_handlers  # chỉ import đăng ký handlers
+
+BOT_TOKEN   = os.getenv("BOT_TOKEN")
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")
+
+if not BOT_TOKEN or not WEBHOOK_URL:
+    raise SystemExit("Missing BOT_TOKEN or WEBHOOK_URL env")
+
+# Telegram Application
+ptb = ApplicationBuilder().token(BOT_TOKEN).build()
+register_handlers(ptb)  # gắn toàn bộ handlers
+
+# FastAPI app
+app = FastAPI()
 
 @app.on_event("startup")
 async def _startup():
-    await initialize(tg_app)
-    await tg_app.start()
+    await ptb.initialize()
+    await ptb.bot.set_webhook(f"{WEBHOOK_URL.rstrip('/')}/webhook")
 
 @app.on_event("shutdown")
 async def _shutdown():
-    await tg_app.stop()
-    await stop(tg_app)
+    await ptb.bot.delete_webhook()
+    await ptb.shutdown()
+    await ptb.stop()
 
-@app.get("/")
-async def root():
-    return {"status": "ok"}
-
-@app.post("/telegram/webhook")
-async def telegram_webhook(request: Request):
-    data = await request.json()
-    update = Update.de_json(data, tg_app.bot)
-    await tg_app.process_update(update)
+@app.post("/webhook")
+async def telegram_webhook(req: Request):
+    data = await req.json()
+    update = Update.de_json(data, ptb.bot)
+    await ptb.process_update(update)
     return {"ok": True}
