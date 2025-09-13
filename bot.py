@@ -1,445 +1,624 @@
-import os, json, re, html, random, string, asyncio, time
-from typing import Dict, List, Optional, Tuple
-import aiohttp
+import os, re, json, asyncio, logging, random
+from typing import Dict, List, Optional, Set
+from urllib.parse import quote_plus
 
+import httpx
+from bs4 import BeautifulSoup
 from telegram import (
-    Update, InlineKeyboardMarkup, InlineKeyboardButton, MessageEntity,
-    ChatPermissions
+    Update, InlineKeyboardMarkup, InlineKeyboardButton, Message, User
 )
-from telegram.constants import ParseMode
 from telegram.ext import (
-    ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler,
-    filters, CallbackQueryHandler, AIORateLimiter
+    Application, ApplicationBuilder, CommandHandler, MessageHandler,
+    CallbackQueryHandler, ContextTypes, filters, JobQueue
 )
 
-# ===================== CONFIG =====================
-BOT_NAME = "SIÊU NHÂN ĐỎ :)"
-LOBBY_SECONDS = int(os.getenv("LOBBY_SECONDS", "60"))
-TURN_SECONDS  = int(os.getenv("TURN_SECONDS",  "30"))
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s"
+)
+log = logging.getLogger("dochoi")
 
-GIST_ID       = os.environ["GIST_ID"]
-GITHUB_TOKEN  = os.environ["GITHUB_TOKEN"]
-DICT_FILE     = "dict_offline.txt"
-CLUE_FILE     = "guess_clue_bank.json"
+BOT_TOKEN   = os.environ["BOT_TOKEN"]
+WEBHOOK_URL = os.environ["WEBHOOK_URL"].rstrip("/")
+GIST_ID     = os.environ["GIST_ID"]
+GIST_TOKEN  = os.environ["GIST_TOKEN"]
+DICT_FILE   = os.getenv("DICT_FILE", "dict_offline.txt")
+GUESS_FILE  = os.getenv("GUESS_FILE", "guess_clue_bank.json")
 
-SOHA_URL_1 = "http://tratu.soha.vn/dict/vn_vn/{q}"          # ưu tiên
-SOHA_URL_2 = "http://tratu.soha.vn/dict/vn_vn/search/{q}"   # fallback
-WIKI_URL   = "https://vi.wiktionary.org/wiki/{q}"           # fallback 2
+# -----------------------------
+# GIST helpers (pure GitHub API)
+# -----------------------------
+GH_API = "https://api.github.com"
 
-TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
+async def gist_get_all(context: ContextTypes.DEFAULT_TYPE) -> Dict:
+    headers = {"Authorization": f"Bearer {GIST_TOKEN}",
+               "Accept": "application/vnd.github+json"}
+    async with httpx.AsyncClient(timeout=20) as client:
+        r = await client.get(f"{GH_API}/gists/{GIST_ID}", headers=headers)
+        r.raise_for_status()
+        return r.json()
 
-# Cà khịa
-TEASE_WRONG = [
-    "Sai bét! Bộ não để trưng à? 🤭",
-    "Không đúng! Nhanh tay nhanh não chút coi!",
-    "Trật lất rồi cậu bé ơi 😏",
-    "Ôi trời ơi, trí tuệ nhân tạo còn ngán cậu!",
-    "Nope! Chưa đúng đâu, nghĩ kỹ lại đi.",
-    "Đoán vậy thì về đội BOT nhé 😹",
-    "Câu trả lời… sai quá sai!",
-    "Chưa chuẩn! Cố lên, còn cơ hội.",
-    "Hụt rồi nha! Nghe tiếng não chưa?",
-    "Trật rồi, đừng nản… nhưng hơi buồn đó!",
-    "Sai mà tự tin thật đấy 😆",
-    "Thôi thôi, đừng mơ nữa bạn ơi!",
-    "Không trúng! Đổi hướng suy nghĩ đi.",
-    "Lại sai… Bot bắt đầu xấu hổ dùm bạn 😶",
-    "Ối giời, sai một ly đi vài cây số!"
-]
-TEASE_REMIND = [
-    "⏳ Thời gian không chờ ai đâu!",
-    "⏳ Còn ít thời gian thôi đấy!",
-    "⏳ Nhanh nhanh nào! Sắp hết giờ!",
-    "⏳ 30 giây trôi nhanh như crush nhìn người khác đấy!",
-    "⏳ Chạy đi chờ chi!",
-]
-TEASE_5S = ["⏰ Còn 5 giây!", "⏰ 5 giây cuối nè!", "⏰ Nhanh lên!"]
+async def gist_get_file(filename: str) -> str:
+    headers = {"Authorization": f"Bearer {GIST_TOKEN}",
+               "Accept": "application/vnd.github+json"}
+    async with httpx.AsyncClient(timeout=20) as client:
+        r = await client.get(f"{GH_API}/gists/{GIST_ID}", headers=headers)
+        r.raise_for_status()
+        data = r.json()["files"].get(filename)
+        if not data:
+            return ""
+        if data.get("truncated"):
+            raw_url = data["raw_url"]
+            r2 = await client.get(raw_url)
+            r2.raise_for_status()
+            return r2.text
+        return data.get("content", "")
 
-# ===================== TIỆN ÍCH =====================
-def norm_space(s: str) -> str:
+async def gist_save_file(filename: str, content: str) -> None:
+    headers = {"Authorization": f"Bearer {GIST_TOKEN}",
+               "Accept": "application/vnd.github+json"}
+    payload = {"files": {filename: {"content": content}}}
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.patch(f"{GH_API}/gists/{GIST_ID}", headers=headers, json=payload)
+        r.raise_for_status()
+
+# -----------------------------
+# Utilities
+# -----------------------------
+def normalize_spaces(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "").strip())
 
-def is_two_word_phrase(s: str) -> bool:
-    return len(norm_space(s).split()) == 2
+def norm_key(s: str) -> str:
+    # khóa so khớp nhẹ: lowercase + rút gọn khoảng trắng
+    return normalize_spaces(s).lower()
 
-def last_word(s: str) -> str:
-    return norm_space(s).split()[-1]
+# -----------------------------
+# OFFLINE DICTIONARY CACHE
+# -----------------------------
+class DictCache:
+    def __init__(self):
+        self.raw: Set[str] = set()     # giữ nguyên có dấu (dùng lưu)
+        self.keys: Set[str] = set()    # key normalize để tra nhanh
+        self.loaded = False
 
-def first_word(s: str) -> str:
-    return norm_space(s).split()[0]
-
-def casefold(s: str) -> str:
-    # so sánh mềm (bảo toàn dấu nhưng không phân biệt hoa/thường & khoảng trắng)
-    return norm_space(s).casefold()
-
-# ===================== GIST I/O =====================
-GIST_API = f"https://api.github.com/gists/{GIST_ID}"
-
-async def gist_get(ctx: ContextTypes.DEFAULT_TYPE, filename: str, default):
-    headers = {"Authorization": f"token {GITHUB_TOKEN}",
-               "Accept": "application/vnd.github+json"}
-    async with aiohttp.ClientSession() as sess:
-        async with sess.get(GIST_API, headers=headers, timeout=30) as r:
-            if r.status != 200:
-                return default
-            data = await r.json()
-            files = data.get("files", {})
-            if filename not in files or files[filename].get("truncated"):
-                # dùng raw_url nếu file lớn
-                raw_url = files.get(filename, {}).get("raw_url")
-                if not raw_url:
-                    return default
-                async with sess.get(raw_url, timeout=30) as r2:
-                    if r2.status != 200:
-                        return default
-                    txt = await r2.text()
-            else:
-                txt = files[filename].get("content") or ""
-    try:
-        return json.loads(txt) if txt.strip() else default
-    except Exception:
-        return default
-
-async def gist_put(filename: str, obj):
-    payload = {"files": {filename: {"content": json.dumps(obj, ensure_ascii=False, indent=2)}}}
-    headers = {"Authorization": f"token {GITHUB_TOKEN}",
-               "Accept": "application/vnd.github+json"}
-    async with aiohttp.ClientSession() as sess:
-        async with sess.patch(GIST_API, headers=headers, json=payload, timeout=30) as r:
-            return r.status in (200, 201)
-
-# ===================== TRA TỪ ONLINE =====================
-async def http_get_text(url: str) -> Tuple[int, str]:
-    async with aiohttp.ClientSession() as sess:
+    async def load(self):
+        if self.loaded:
+            return
         try:
-            async with sess.get(url, timeout=20) as r:
-                return r.status, await r.text()
-        except Exception:
-            return 0, ""
+            txt = await gist_get_file(DICT_FILE)
+            if not txt.strip():
+                txt = "[]"
+            data = json.loads(txt)
+            for phrase in data:
+                k = norm_key(phrase)
+                self.raw.add(phrase)
+                self.keys.add(k)
+            self.loaded = True
+            log.info("Loaded %d phrases from gist", len(self.raw))
+        except Exception as e:
+            log.exception("Load dict failed: %s", e)
+            self.loaded = True  # vẫn cho chạy
 
-def page_says_not_found(html_text: str) -> bool:
-    t = html_text.lower()
-    return ("không tìm thấy" in t) or ("khong tim thay" in t) or ("no results" in t)
+    async def persist(self):
+        try:
+            data = sorted(self.raw)
+            await gist_save_file(DICT_FILE, json.dumps(data, ensure_ascii=False, indent=2))
+            log.info("Persisted dict: %d items", len(data))
+        except Exception as e:
+            log.exception("Persist dict failed: %s", e)
 
-def page_looks_like_entry(html_text: str) -> bool:
-    t = html_text.lower()
-    # heuristics cho soha & wiktionary
-    return ("từ điển việt" in t) or ("wiktionary" in t and "vi.wiktionary.org" in t) or ("class=\"title\"" in t)
+    def has(self, phrase: str) -> bool:
+        return norm_key(phrase) in self.keys
 
-async def check_on_soha(phrase: str) -> Optional[bool]:
-    q = aiohttp.helpers.quote(phrase, safe="")
-    for url_tpl in (SOHA_URL_1, SOHA_URL_2):
-        code, body = await http_get_text(url_tpl.format(q=q))
-        if code == 0:
-            continue
-        if code == 200:
-            if page_says_not_found(body):
-                return False
-            if page_looks_like_entry(body):
-                return True
-    return None  # không chắc
+    def add(self, phrase: str):
+        if not self.has(phrase):
+            self.raw.add(phrase)
+            self.keys.add(norm_key(phrase))
 
-async def check_on_wiktionary(phrase: str) -> Optional[bool]:
-    q = aiohttp.helpers.quote(phrase.replace(" ", "_"), safe="")
-    code, body = await http_get_text(WIKI_URL.format(q=q))
-    if code == 200 and not page_says_not_found(body):
-        return True if page_looks_like_entry(body) else None
-    return False
+DICT = DictCache()
 
-async def phrase_has_meaning(phrase: str, cache: List[str]) -> bool:
-    # cache trước
-    cf = casefold(phrase)
-    if any(casefold(x) == cf for x in cache):
+# -----------------------------
+# ONLINE CHECKERS
+# -----------------------------
+NEG_MARKERS = [
+    "không tìm thấy", "không có kết quả", "rất tiếc", "404", "not found"
+]
+
+async def check_soha(phrase: str) -> bool:
+    """
+    Kiểm tra nhanh trên tratu.soha.vn (không dùng lxml).
+    Hợp lệ nếu HTTP 200 và trang không chứa các cụm "không tìm thấy".
+    """
+    url = f"http://tratu.soha.vn/dict/vn_vn/{quote_plus(phrase)}"
+    async with httpx.AsyncClient(follow_redirects=True, timeout=15) as client:
+        r = await client.get(url, headers={"User-Agent": "Mozilla/5.0"})
+        if r.status_code != 200:
+            return False
+        text = r.text.lower()
+        if any(bad in text for bad in NEG_MARKERS):
+            return False
+        # một số kiểm tra nhẹ bằng BS4 (parser thuần Python)
+        soup = BeautifulSoup(r.text, "html.parser")
+        title = (soup.title.get_text() if soup.title else "").lower()
+        if phrase.lower() in title:
+            return True
+        # Nếu có khối nội dung từ điển/dịch nghĩa → coi như hợp lệ
+        if soup.find(id="content-tdict") or soup.find(class_=re.compile("detail|explain|mean", re.I)):
+            return True
+        # fallback: trang dài có chữ 'từ điển' cũng tạm coi hợp lệ
+        if "từ điển" in text and len(text) > 2000:
+            return True
+        return False
+
+async def check_wiktionary(phrase: str) -> bool:
+    url = f"https://vi.wiktionary.org/wiki/{quote_plus(phrase.replace(' ', '_'))}"
+    async with httpx.AsyncClient(follow_redirects=True, timeout=15) as client:
+        r = await client.get(url, headers={"User-Agent": "Mozilla/5.0"})
+        if r.status_code != 200:
+            return False
+        t = r.text.lower()
+        if any(bad in t for bad in ["trang này không tồn tại", "không tìm thấy"]):
+            return False
+        return len(t) > 1500
+
+async def phrase_is_valid(phrase: str) -> bool:
+    phrase = normalize_spaces(phrase)
+    # phải đúng 2 từ
+    parts = phrase.split(" ")
+    if len(parts) != 2:
+        return False
+    # tra offline
+    if DICT.has(phrase):
         return True
-    # online (Soha → Wiktionary)
-    ok = await check_on_soha(phrase)
-    if ok is None:
-        ok = await check_on_wiktionary(phrase)
-    return bool(ok)
+    # tra online (Soha trước, rồi Wiktionary)
+    ok = await check_soha(phrase)
+    if not ok:
+        ok = await check_wiktionary(phrase)
+    if ok:
+        DICT.add(phrase)
+        # lưu không đồng bộ (không chặn lượt chơi)
+        asyncio.create_task(DICT.persist())
+    return ok
 
-# ===================== TRẠNG THÁI =====================
-class Lobby:
-    def __init__(self, mode: str):
-        self.mode = mode               # "doi" | "doan"
-        self.players: List[int] = []
-        self.started = False
-        self.job = None
+# -----------------------------
+# GAME STATE
+# -----------------------------
+TAUNTS_DOICHU = [
+    "Sai rồi nha! Động não lại nào 🤯",
+    "Không ổn! Cụm này tớ chưa thấy trong từ điển 😅",
+    "Trượt rồi, thử câu gọn gàng hơn xem?",
+    "Không hợp lệ – kiếm cụm có nghĩa nha!",
+    "Hơi gượng ép đó… cho tớ cụm chuẩn hơn!",
+    "Cụm này lạ quá, từ điển bó tay 😵‍💫",
+    "Chưa được đâu, thử lại đi chiến hữu!",
+    "Ối dồi, chưa đúng! Đổi bài nha!",
+    "Không qua vòng gửi xe 🚫",
+    "Cụm chuẩn nghĩa mới tính điểm nha!"
+]
 
-class DoiChuState:
-    def __init__(self, players: List[int], play_with_bot: bool):
-        self.players = players[:]      # id
-        self.play_with_bot = play_with_bot
+TAUNTS_DOAN = [
+    "Sai mất rồi 😝", "Không phải đáp án đâu!", "Hụt rồi nha!",
+    "Gần đúng… nhưng không phải 😆", "Trật lất!", "Hơi lệch pha!",
+    "Thử hướng khác xem 👀", "Không đúng, cố lên!",
+    "Đáp án vẫn ẩn…", "Nope!", "Sai mất tiêu!",
+    "Lệch sóng 📡", "Chưa phải, đừng nản!", "Chệch một xíu!",
+    "Ố la la – chưa đúng!"
+]
+
+class DoiChuRoom:
+    def __init__(self, chat_id: int):
+        self.chat_id = chat_id
+        self.players: List[User] = []
+        self.alive: List[int] = []      # user_id còn sống
+        self.current_idx = 0
+        self.last_word: Optional[str] = None
+        self.message_id_rules: Optional[int] = None
+        self.is_vs_bot = False
+        self.turn_job = None
+
+class DoanChuRoom:
+    def __init__(self, chat_id: int):
+        self.chat_id = chat_id
+        self.players: List[User] = []
         self.turn_idx = 0
-        self.current_required: Optional[str] = None   # từ phải bắt đầu
-        self.used: List[str] = []
-        self.alive = {uid: True for uid in players}
-        if play_with_bot:
-            self.alive[0] = True  # BOT id 0
+        self.guess_left: Dict[int, int] = {}
+        self.qa = None  # {"q":, "a":, "hints":[]}
+        self.turn_job = None
 
-class DoanChuState:
-    def __init__(self, qid: int, question: str, answer: str, hints: List[str], players: List[int]):
-        self.qid = qid
-        self.question = question
-        self.answer = answer
-        self.hints = hints or []
-        self.players = players[:]
-        self.guess_used = {uid: 0 for uid in players}
-        self.alive = {uid: True for uid in players}
-        self.start_time = time.time()
+# Mỗi chat một state
+def gc(chat_data: dict) -> dict:
+    if "state" not in chat_data:
+        chat_data["state"] = {"mode": None, "room": None, "lobby": None}
+    return chat_data["state"]
 
-chat_lobby: Dict[int, Lobby] = {}
-chat_game_doi: Dict[int, DoiChuState] = {}
-chat_game_doan: Dict[int, DoanChuState] = {}
+# -----------------------------
+# GIST câu hỏi đoán chữ
+# -----------------------------
+async def load_guess_bank() -> List[dict]:
+    txt = await gist_get_file(GUESS_FILE)
+    if not txt.strip():
+        return []
+    try:
+        return json.loads(txt)
+    except Exception:
+        return []
 
-# ===================== UI & LUẬT =====================
-RULE_DOI = (
-    "🎮 *ĐỐI CHỮ*\n"
-    "• Cụm *2 từ có nghĩa* (giữ nguyên dấu).\n"
-    "• Lượt sau *bắt đầu bằng từ cuối* của cụm trước.\n"
-    f"• Mỗi lượt {TURN_SECONDS}s: nhắc 30s & 5s; *sai/ hết giờ = loại*.\n"
-    f"• Mở sảnh {LOBBY_SECONDS}s bằng /newgame_doi, mọi người /join để tham gia."
-)
-RULE_DOAN = (
-    "🧩 *ĐOÁN CHỮ*\n"
-    "• Bot bốc câu hỏi (tục ngữ/ca dao/thành ngữ...).\n"
-    "• Mỗi người có *tối đa 3 lần đoán* trong cả ván; hết lượt = loại.\n"
-    f"• Mở sảnh {LOBBY_SECONDS}s bằng /newgame_doan, mọi người /join để tham gia.\n"
-    "• Thêm câu mới: `/themcau CÂU HỎI || ĐÁP ÁN || gợi ý1 || gợi ý2` (DM bot hoặc admin group)."
-)
+async def append_guess_item(item: dict):
+    bank = await load_guess_bank()
+    bank.append(item)
+    await gist_save_file(GUESS_FILE, json.dumps(bank, ensure_ascii=False, indent=2))
 
-# ===================== HANDLERS =====================
+# -----------------------------
+# UI /start
+# -----------------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🎮 Game Đối Chữ", callback_data="pick_doi")],
-        [InlineKeyboardButton("🧩 Game Đoán Chữ", callback_data="pick_doan")],
-    ])
-    await update.effective_message.reply_text(
-        "Chọn trò nào chơi nè 👇", reply_markup=kb)
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("🎮 Game Đối Chữ", callback_data="menu_doi"),
+        InlineKeyboardButton("🧩 Game Đoán Chữ", callback_data="menu_doan")
+    ]])
+    await update.effective_chat.send_message(
+        "Chọn trò nào nè 👇",
+        reply_markup=kb
+    )
 
-async def on_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def on_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-    if q.data == "pick_doi":
-        await q.message.reply_text(RULE_DOI, parse_mode=ParseMode.MARKDOWN)
-        await q.message.reply_text("Gõ /newgame_doi để mở sảnh 60s, mọi người dùng /join để tham gia.")
+    mode = q.data
+    state = gc(context.chat_data)
+    state["mode"] = None
+    state["room"] = None
+    state["lobby"] = {"players": []}
+
+    if mode == "menu_doi":
+        text = ("🎮 *ĐỐI CHỮ*\n"
+                "• Đối *cụm 2 từ có nghĩa*. Lượt sau phải bắt đầu bằng *từ cuối* của cụm trước.\n"
+                "• Mở sảnh 60s. /join để tham gia.\n"
+                "• Mỗi lượt 30s. Sai/không hợp lệ/het giờ ⇒ loại.")
+        kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("🔔 Mở sảnh (newgame)", callback_data="doi_new"),
+            InlineKeyboardButton("🔑 Tham gia (join)", callback_data="doi_join")
+        ]])
+        msg = await q.message.reply_text(text, reply_markup=kb, parse_mode="Markdown")
     else:
-        await q.message.reply_text(RULE_DOAN, parse_mode=ParseMode.MARKDOWN)
-        await q.message.reply_text("Gõ /newgame_doan để mở sảnh 60s, mọi người dùng /join để tham gia.")
+        text = ("🧩 *ĐOÁN CHỮ*\n"
+                "• Random câu hỏi (ca dao/thành ngữ...).\n"
+                "• Mỗi người *3 lượt đoán*. Hết lượt trước ⇒ bị loại.\n"
+                "• /join để tham gia. Bắt đầu sau 60s.")
+        kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("🔔 Mở sảnh (newgame)", callback_data="doan_new"),
+            InlineKeyboardButton("🔑 Tham gia (join)", callback_data="doan_join")
+        ]])
+        msg = await q.message.reply_text(text, reply_markup=kb, parse_mode="Markdown")
+    state["rule_message_id"] = msg.message_id
 
-async def newgame_doi(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    cid = update.effective_chat.id
-    chat_lobby[cid] = Lobby("doi")
-    await update.effective_message.reply_text(f"🎮 Mở sảnh! Gõ /join để tham gia. 🔔 Tự bắt đầu sau {LOBBY_SECONDS}s nếu có người tham gia.")
-    job = context.job_queue.run_once(lambda c: asyncio.create_task(begin_game_doi(c, cid)), when=LOBBY_SECONDS)
-    chat_lobby[cid].job = job
+# -----------------------------
+# Lobby & Join
+# -----------------------------
+LOBBY_SECONDS = 60
+TURN_SECONDS  = 30
 
-async def newgame_doan(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    cid = update.effective_chat.id
-    chat_lobby[cid] = Lobby("doan")
-    await update.effective_message.reply_text(f"🧩 Mở sảnh! Gõ /join để tham gia. 🔔 Tự bắt đầu sau {LOBBY_SECONDS}s nếu có người tham gia.")
-    job = context.job_queue.run_once(lambda c: asyncio.create_task(begin_game_doan(c, cid)), when=LOBBY_SECONDS)
-    chat_lobby[cid].job = job
+async def lobby_tick(context: ContextTypes.DEFAULT_TYPE):
+    chat_id = context.job.chat_id
+    kind    = context.job.data["kind"]
+    state   = gc(context.chat_data)
+    players = state["lobby"]["players"]
 
-async def join(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    cid = update.effective_chat.id
-    uid = update.effective_user.id
-    lobby = chat_lobby.get(cid)
-    if not lobby:
-        return await update.effective_message.reply_text("Chưa có sảnh. Dùng /newgame_doi hoặc /newgame_doan.")
-    if uid not in lobby.players:
-        lobby.players.append(uid)
-        name = update.effective_user.mention_html()
-        await update.effective_message.reply_html(f"✅ {name} đã tham gia!")
+    if not players:
+        await context.bot.send_message(chat_id, "⏰ Hết 60s nhưng chưa ai /join. Hủy sảnh.")
+        state["lobby"] = None
+        return
+
+    if kind == "doi":
+        room = DoiChuRoom(chat_id)
+        room.players = players.copy()
+        room.alive   = [u.id for u in room.players]
+        room.is_vs_bot = (len(room.players) == 1)
+        state["mode"] = "doi"
+        state["room"] = room
+        await context.bot.send_message(chat_id,
+            f"🔔 Bắt đầu! {len(room.players)} người tham gia. " +
+            ("Chơi với BOT." if room.is_vs_bot else "BOT chỉ làm trọng tài.")
+        )
+        # chọn người bắt đầu
+        room.current_idx = 0 if room.is_vs_bot else random.randrange(len(room.players))
+        room.last_word = None
+        await announce_next_turn_doi(context, room)
     else:
-        await update.effective_message.reply_text("Bạn đã trong sảnh rồi.")
-
-# ---------- BẮT ĐẦU GAME ----------
-async def begin_game_doi(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
-    lobby = chat_lobby.get(chat_id)
-    if not lobby or lobby.mode != "doi" or lobby.started:
-        return
-    if not lobby.players:
-        await context.bot.send_message(chat_id, "Không ai tham gia. Hủy sảnh.")
-        chat_lobby.pop(chat_id, None)
-        return
-    lobby.started = True
-    play_with_bot = len(lobby.players) == 1
-    chat_game_doi[chat_id] = DoiChuState(lobby.players, play_with_bot)
-    chat_lobby.pop(chat_id, None)
-
-    if play_with_bot:
-        await context.bot.send_message(chat_id, f"👤 Chỉ 1 người → *chơi với BOT*.\n✨ Lượt đầu: gửi *cụm 2 từ có nghĩa* bất kỳ.\nSau đó đối tiếp bằng *từ cuối*.", parse_mode=ParseMode.MARKDOWN)
-    else:
-        await context.bot.send_message(chat_id, "👥 Nhiều người tham gia. BOT trọng tài, các bạn đấu với nhau nhé!\n✨ Lượt đầu: gửi *cụm 2 từ có nghĩa* bất kỳ.", parse_mode=ParseMode.MARKDOWN)
-
-    # Reminder job mỗi 30s và ping 5s
-    context.job_queue.run_repeating(lambda c: asyncio.create_task(remind_turn_doi(c, chat_id)),
-                                    interval=30, first=30, name=f"remind_doi_{chat_id}")
-
-async def begin_game_doan(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
-    lobby = chat_lobby.get(chat_id)
-    if not lobby or lobby.mode != "doan" or lobby.started:
-        return
-    if not lobby.players:
-        await context.bot.send_message(chat_id, "Không ai tham gia. Hủy sảnh.")
-        chat_lobby.pop(chat_id, None)
-        return
-    lobby.started = True
-    # Bốc câu hỏi
-    bank: List[dict] = await gist_get(context, CLUE_FILE, default=[])
-    if not bank:
-        await context.bot.send_message(chat_id, "Kho câu hỏi trống. Thêm với /themcau CÂU || ĐÁP || gợi ý …")
-        chat_lobby.pop(chat_id, None)
-        return
-    item = random.choice(bank)
-    state = DoanChuState(item.get("id", random.randint(1, 10**9)),
-                         item["question"], item["answer"], item.get("hints", []),
-                         lobby.players)
-    chat_game_doan[chat_id] = state
-    chat_lobby.pop(chat_id, None)
-
-    await context.bot.send_message(chat_id,
-        f"🧩 *Câu hỏi:* {html.escape(state.question)}\n"
-        f"👥 Người chơi: {len(state.players)}\n"
-        f"➡️ Mỗi người tối đa *3 lần đoán*. Gõ đáp án ngay!",
-        parse_mode=ParseMode.MARKDOWN)
-
-    context.job_queue.run_repeating(lambda c: asyncio.create_task(remind_turn_doan(c, chat_id)),
-                                    interval=30, first=30, name=f"remind_doan_{chat_id}")
-
-# ---------- REMINDERS ----------
-async def remind_turn_doi(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
-    if chat_id not in chat_game_doi:
-        context.job_queue.get_jobs_by_name(f"remind_doi_{chat_id}")
-        return
-    await context.bot.send_message(chat_id, random.choice(TEASE_REMIND))
-
-async def remind_turn_doan(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
-    if chat_id not in chat_game_doan:
-        return
-    await context.bot.send_message(chat_id, random.choice(TEASE_REMIND))
-
-# ---------- THÊM CÂU HỎI ----------
-def is_admin(update: Update) -> bool:
-    return update.effective_chat.type == "private" or update.effective_user.id in getattr(update.effective_chat, "get_administrators", lambda:[])()
-
-async def themcau(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = norm_space(update.effective_message.text_html or "")
-    # /themcau CÂU || ĐÁP || hint1 || hint2 ...
-    parts = [norm_space(p) for p in text.split(" ", 1)[1].split("||")]
-    if len(parts) < 2:
-        return await update.message.reply_text("Cú pháp: /themcau CÂU HỎI || ĐÁP ÁN || gợi ý1 || gợi ý2 ...")
-    q, a = parts[0], parts[1]
-    hints = [h for h in (p.strip() for p in parts[2:]) if h]
-    bank: List[dict] = await gist_get(context, CLUE_FILE, default=[])
-    new_id = (max([it.get("id", 0) for it in bank]) + 1) if bank else 1
-    bank.append({"id": new_id, "question": q, "answer": a, "hints": hints})
-    ok = await gist_put(CLUE_FILE, bank)
-    if ok:
-        await update.message.reply_text(f"Đã lưu câu #{new_id} ✅\nTổng: {len(bank)}")
-    else:
-        await update.message.reply_text("Lưu thất bại (Gist).")
-
-# ===================== XỬ LÝ TIN NHẮN TRONG GAME =====================
-async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    cid = update.effective_chat.id
-    uid = update.effective_user.id
-    text = norm_space(update.effective_message.text or "")
-
-    # ĐỐI CHỮ
-    if cid in chat_game_doi:
-        state = chat_game_doi[cid]
-        # chỉ nhận cụm 2 từ
-        if not is_two_word_phrase(text):
+        bank = await load_guess_bank()
+        if not bank:
+            await context.bot.send_message(chat_id, "Chưa có câu hỏi trong ngân hàng (guess_clue_bank.json).")
+            state["lobby"] = None
             return
-        # Nếu đang yêu cầu phải bắt đầu bằng từ nào đó
-        if state.current_required:
-            if first_word(text).casefold() != state.current_required.casefold():
-                return await update.message.reply_text(
-                    f"❌ Cụm phải *bắt đầu bằng* “{state.current_required}”.", parse_mode=ParseMode.MARKDOWN)
+        room = DoanChuRoom(chat_id)
+        room.players = players.copy()
+        for u in room.players:
+            room.guess_left[u.id] = 3
+        room.qa = random.choice(bank)
+        state["mode"] = "doan"
+        state["room"] = room
+        await context.bot.send_message(chat_id,
+            f"🔔 Bắt đầu! {len(room.players)} người tham gia.\n"
+            f"❓ Câu hỏi: *{room.qa.get('question','')}*\n"
+            f"💡 Gợi ý: {', '.join(room.qa.get('hints', [])) if room.qa.get('hints') else '—'}",
+            parse_mode="Markdown"
+        )
+        await announce_next_turn_doan(context, room)
 
-        # Kiểm tra nghĩa (cache → online)
-        cache: List[str] = await gist_get(context, DICT_FILE, default=[])
-        has = await phrase_has_meaning(text, cache)
-        if not has:
-            return await update.message.reply_text(f"❌ Cụm không có nghĩa (không tìm thấy). {random.choice(TEASE_WRONG)}")
+async def handle_new_join(update: Update, context: ContextTypes.DEFAULT_TYPE, kind: str):
+    q = update.callback_query
+    await q.answer()
+    state = gc(context.chat_data)
+    if state.get("room") or not state.get("lobby"):
+        state["lobby"] = {"players": []}
+    # thêm người
+    user = q.from_user
+    players: List[User] = state["lobby"]["players"]
+    if user.id not in [u.id for u in players]:
+        players.append(user)
+        await q.message.reply_text(f"✅ {user.mention_html()} đã tham gia!", parse_mode="HTML")
 
-        # hợp lệ → cập nhật cache nếu chưa có
-        if not any(casefold(x) == casefold(text) for x in cache):
-            cache.append(text)
-            await gist_put(DICT_FILE, cache)
+async def on_doi_new(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    state = gc(context.chat_data)
+    state["lobby"] = {"players": []}
+    await update.callback_query.answer()
+    await update.effective_chat.send_message("🎮 Mở sảnh! Gõ /join để tham gia. 🔔 Tự bắt đầu sau 60s nếu có người tham gia.")
+    # đặt hẹn giờ
+    context.job_queue.run_once(lobby_tick, when=LOBBY_SECONDS, chat_id=update.effective_chat.id,
+                               name=f"lobby_doi_{update.effective_chat.id}",
+                               data={"kind": "doi"})
 
-        state.used.append(text)
-        state.current_required = last_word(text)
+async def on_doan_new(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    state = gc(context.chat_data)
+    state["lobby"] = {"players": []}
+    await update.callback_query.answer()
+    await update.effective_chat.send_message("🧩 Mở sảnh! Gõ /join để tham gia. 🔔 Tự bắt đầu sau 60s nếu có người tham gia.")
+    context.job_queue.run_once(lobby_tick, when=LOBBY_SECONDS, chat_id=update.effective_chat.id,
+                               name=f"lobby_doan_{update.effective_chat.id}",
+                               data={"kind": "doan"})
 
-        # Nếu chỉ 1 người → BOT đáp trả (tìm cụm trong cache bắt đầu bằng từ đó)
-        if state.play_with_bot:
-            await update.message.reply_text(f"✅ Được! Từ chốt: “{state.current_required}”.")
-            # BOT tìm trong cache một cụm hợp lệ bắt đầu = từ required
-            candidates = [p for p in cache if first_word(p).casefold() == state.current_required.casefold() and p not in state.used]
-            if not candidates:
-                await context.bot.send_message(cid, "🤖 BOT chịu! Bạn thắng 👑")
-                chat_game_doi.pop(cid, None)
-                return
-            bot_phrase = random.choice(candidates)
-            state.used.append(bot_phrase)
-            state.current_required = last_word(bot_phrase)
-            await context.bot.send_message(cid, f"🤖 BOT: {bot_phrase}\n👉 Lượt bạn. Bắt đầu bằng: “{state.current_required}”.")
-        else:
-            # Nhiều người: công bố từ chốt; ai cũng có thể gửi lượt tiếp
-            await context.bot.send_message(cid, f"✅ Hợp lệ. Từ chốt: “{state.current_required}”.")
+async def on_join_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    state = gc(context.chat_data)
+    if not state.get("lobby"):
+        await update.message.reply_text("Chưa mở sảnh. Ấn /start để chọn game rồi bấm *Mở sảnh*.", parse_mode="Markdown")
+        return
+    players: List[User] = state["lobby"]["players"]
+    user = update.effective_user
+    if user.id not in [u.id for u in players]:
+        players.append(user)
+        await update.message.reply_text(f"✅ {user.mention_html()} đã tham gia!", parse_mode="HTML")
+
+# -----------------------------
+# ĐỐI CHỮ – vòng chơi
+# -----------------------------
+async def announce_next_turn_doi(context: ContextTypes.DEFAULT_TYPE, room: DoiChuRoom):
+    # dừng job cũ
+    if room.turn_job:
+        room.turn_job.schedule_removal()
+    # loại người đã bị loại
+    room.alive = [uid for uid in room.alive if uid in [u.id for u in room.players]]
+    if room.is_vs_bot and room.alive and room.alive[0] != room.players[0].id:
+        room.alive = [room.players[0].id]
+
+    if not room.alive:
+        await context.bot.send_message(room.chat_id, "Hết người chơi. Kết thúc ván.")
+        gc(context.chat_data)["room"] = None
         return
 
-    # ĐOÁN CHỮ
-    if cid in chat_game_doan:
-        st = chat_game_doan[cid]
-        if uid not in st.alive or not st.alive[uid]:
+    # xác định người tới lượt
+    if room.current_idx >= len(room.players):
+        room.current_idx = 0
+    cur_user = room.players[room.current_idx]
+    if cur_user.id not in room.alive:
+        # chuyển tới người kế
+        room.current_idx = (room.current_idx + 1) % len(room.players)
+        await announce_next_turn_doi(context, room)
+        return
+
+    need = f"*{room.last_word}*" if room.last_word else "bất kỳ"
+    await context.bot.send_message(
+        room.chat_id,
+        f"👉 {cur_user.mention_html()} tới lượt. Gửi *cụm 2 từ có nghĩa* (bắt đầu bằng {need}).",
+        parse_mode="HTML"
+    )
+    # đặt timer nhắc + hết giờ
+    room.turn_job = context.job_queue.run_once(doi_turn_timeout, TURN_SECONDS, chat_id=room.chat_id,
+                                               data={"uid": cur_user.id})
+
+async def doi_turn_timeout(context: ContextTypes.DEFAULT_TYPE):
+    chat_id = context.job.chat_id
+    uid = context.job.data["uid"]
+    state = gc(context.chat_data)
+    room: DoiChuRoom = state.get("room")
+    if not room or state.get("mode") != "doi": 
+        return
+    if uid in room.alive:
+        room.alive.remove(uid)
+        await context.bot.send_message(chat_id, "⏰ Hết giờ! Bị loại.")
+    # chuyển lượt
+    room.current_idx = (room.current_idx + 1) % len(room.players)
+    await announce_next_turn_doi(context, room)
+
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Bắt mọi tin nhắn text trong chat – kiểm tra trò đang chạy và xử lý.
+    """
+    state = gc(context.chat_data)
+    mode  = state.get("mode")
+    if not mode or not state.get("room"):
+        return
+
+    text = normalize_spaces(update.message.text)
+    user = update.effective_user
+
+    # -------- ĐỐI CHỮ --------
+    if mode == "doi":
+        room: DoiChuRoom = state["room"]
+        if user.id != room.players[room.current_idx].id:
+            return  # không tới lượt
+
+        # kiểm tra 2 từ & chữ cái đầu nếu có last_word
+        parts = text.split(" ")
+        if len(parts) != 2:
+            await update.message.reply_text("❌ Cần *đúng 2 từ*. Thử lại nhé.", parse_mode="Markdown")
             return
-        # chặn spam
-        st.guess_used[uid] = st.guess_used.get(uid, 0) + 1
-        if casefold(text) == casefold(st.answer):
-            await update.message.reply_text("🎉 *Chính xác!* Bạn là nhà vô địch!", parse_mode=ParseMode.MARKDOWN)
-            chat_game_doan.pop(cid, None)
+        if room.last_word and parts[0].lower() != room.last_word.lower():
+            await update.message.reply_text(
+                f"❌ Sai luật. Cụm phải bắt đầu bằng **{room.last_word}**.", parse_mode="Markdown"
+            )
             return
-        else:
-            left = 3 - st.guess_used[uid]
-            if left <= 0:
-                st.alive[uid] = False
-                await update.message.reply_text(f"❌ {random.choice(TEASE_WRONG)}\nBạn đã hết 3 lượt → *bị loại*.", parse_mode=ParseMode.MARKDOWN)
+
+        ok = await phrase_is_valid(text)
+        if not ok:
+            await update.message.reply_text(f"❌ {random.choice(TAUNTS_DOICHU)}\n*Cụm không có nghĩa* (không tìm thấy).",
+                                            parse_mode="Markdown")
+            # loại
+            if user.id in room.alive:
+                room.alive.remove(user.id)
+            room.current_idx = (room.current_idx + 1) % len(room.players)
+            await announce_next_turn_doi(context, room)
+            return
+
+        # câu hợp lệ → cập nhật, chuyển lượt
+        room.last_word = parts[1]
+        # nếu chơi với BOT → BOT đáp
+        if room.is_vs_bot:
+            await update.message.reply_text("✅ Hợp lệ. Đến BOT…")
+            await asyncio.sleep(1.2)
+            # BOT chọn cụm bất kỳ bắt đầu bằng last_word
+            candidate = None
+            for p in sorted(DICT.raw):
+                ps = p.split(" ")
+                if len(ps) == 2 and ps[0].lower() == room.last_word.lower():
+                    candidate = p
+                    break
+            if candidate:
+                await context.bot.send_message(room.chat_id, f"🤖 BOT: {candidate}")
+                room.last_word = candidate.split(" ")[1]
+                await announce_next_turn_doi(context, room)
             else:
-                await update.message.reply_text(f"❌ {random.choice(TEASE_WRONG)}\nBạn còn {left}/3 lượt.")
-            # kết thúc nếu mọi người bị loại
-            if not any(st.alive.values()):
-                await context.bot.send_message(cid, "⏹ Hết người chơi. Kết thúc ván.")
-                chat_game_doan.pop(cid, None)
+                await context.bot.send_message(room.chat_id, "🤖 BOT bí rồi. Bạn thắng!")
+                gc(context.chat_data)["room"] = None
             return
 
-# ===================== LỆNH TIỆN ÍCH =====================
-async def stop_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    cid = update.effective_chat.id
-    chat_lobby.pop(cid, None)
-    chat_game_doi.pop(cid, None)
-    chat_game_doan.pop(cid, None)
-    await update.message.reply_text("⛔ Đã dừng mọi thứ trong phòng.")
+        # nhiều người chơi
+        room.current_idx = (room.current_idx + 1) % len(room.players)
+        await announce_next_turn_doi(context, room)
+        return
 
-# ===================== BOOTSTRAP =====================
-def build_app():
-    app = ApplicationBuilder().token(TELEGRAM_TOKEN).rate_limiter(AIORateLimiter()).build()
+    # -------- ĐOÁN CHỮ --------
+    if mode == "doan":
+        room: DoanChuRoom = state["room"]
+        cur = room.players[room.turn_idx]
+        if user.id != cur.id:
+            return
+        # so khớp không phân biệt hoa thường & bỏ khoảng trắng thừa
+        ans = normalize_spaces(room.qa.get("answer", ""))
+        if norm_key(text) == norm_key(ans):
+            await update.message.reply_text(f"🎉 Chính xác! *{ans}*", parse_mode="Markdown")
+            gc(context.chat_data)["room"] = None
+            return
+        # sai → trừ lượt
+        room.guess_left[user.id] -= 1
+        left = room.guess_left[user.id]
+        await update.message.reply_text(f"❌ {random.choice(TAUNTS_DOAN)}  (còn {left} lượt)")
+        if left <= 0:
+            await update.message.reply_text("🚫 Hết lượt – bị loại.")
+            room.players = [u for u in room.players if u.id != user.id]
+            if not room.players:
+                await update.message.reply_text("Hết người chơi. Kết thúc ván.")
+                gc(context.chat_data)["room"] = None
+                return
+            # cập nhật con trỏ
+            room.turn_idx %= len(room.players)
+        else:
+            # chuyển người tiếp theo
+            room.turn_idx = (room.turn_idx + 1) % len(room.players)
+        await announce_next_turn_doan(context, room)
+
+async def announce_next_turn_doan(context: ContextTypes.DEFAULT_TYPE, room: DoanChuRoom):
+    if room.turn_job:
+        room.turn_job.schedule_removal()
+    if not room.players:
+        gc(context.chat_data)["room"] = None
+        return
+    cur = room.players[room.turn_idx]
+    await context.bot.send_message(room.chat_id, f"👉 {cur.mention_html()} tới lượt đoán.", parse_mode="HTML")
+    room.turn_job = context.job_queue.run_once(doan_turn_timeout, TURN_SECONDS, chat_id=room.chat_id,
+                                               data={"uid": cur.id})
+
+async def doan_turn_timeout(context: ContextTypes.DEFAULT_TYPE):
+    state = gc(context.chat_data)
+    room: DoanChuRoom = state.get("room")
+    if not room or state.get("mode") != "doan":
+        return
+    cur = room.players[room.turn_idx]
+    if room.guess_left.get(cur.id, 0) > 0:
+        room.guess_left[cur.id] -= 1
+        await context.bot.send_message(room.chat_id, f"⏰ Hết giờ! {cur.first_name} mất lượt (còn {room.guess_left[cur.id]}).")
+        if room.guess_left[cur.id] <= 0:
+            await context.bot.send_message(room.chat_id, "🚫 Hết lượt – bị loại.")
+            room.players = [u for u in room.players if u.id != cur.id]
+            if not room.players:
+                await context.bot.send_message(room.chat_id, "Hết người chơi. Kết thúc ván.")
+                gc(context.chat_data)["room"] = None
+                return
+            room.turn_idx %= len(room.players)
+        else:
+            room.turn_idx = (room.turn_idx + 1) % len(room.players)
+        await announce_next_turn_doan(context, room)
+
+# -----------------------------
+# /addqa (thêm câu hỏi đoán chữ) — chỉ dùng khi cần
+# cú pháp: /addqa CÂU HỎI || ĐÁP ÁN || gợi ý1|gợi ý2
+# -----------------------------
+ADMIN_USERS = set(u.strip().lower() for u in os.getenv("ADMIN_USERNAMES", "").split(",") if u.strip())
+
+async def addqa(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if ADMIN_USERS and (user.username or "").lower() not in ADMIN_USERS:
+        await update.message.reply_text("Bạn không có quyền dùng lệnh này.")
+        return
+    text = update.message.text.partition(" ")[2]
+    parts = [p.strip() for p in text.split("||")]
+    if len(parts) < 2:
+        await update.message.reply_text("Sai cú pháp. Ví dụ:\n/addqa Mẹ đi chợ || Bán cá || mẹ|chợ|cá")
+        return
+    hints = []
+    if len(parts) >= 3 and parts[2]:
+        hints = [h.strip() for h in parts[2].split("|") if h.strip()]
+    item = {"question": parts[0], "answer": parts[1], "hints": hints}
+    await append_guess_item(item)
+    await update.message.reply_text("✅ Đã lưu vào gist.")
+
+# -----------------------------
+# /start webhook server
+# -----------------------------
+def main():
+    app: Application = ApplicationBuilder().token(BOT_TOKEN).build()
+
+    # pre-load dict
+    app.job_queue.run_once(lambda c: asyncio.create_task(DICT.load()), 0)
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CallbackQueryHandler(on_pick, pattern="^pick_"))
-    app.add_handler(CommandHandler("newgame_doi", newgame_doi))
-    app.add_handler(CommandHandler("newgame_doan", newgame_doan))
-    app.add_handler(CommandHandler("join", join))
-    app.add_handler(CommandHandler("themcau", themcau))
-    app.add_handler(CommandHandler("stop", stop_all))
+    app.add_handler(CallbackQueryHandler(on_menu, pattern="^menu_"))
+    app.add_handler(CallbackQueryHandler(on_doi_new, pattern="^doi_new$"))
+    app.add_handler(CallbackQueryHandler(on_doan_new, pattern="^doan_new$"))
+    app.add_handler(CallbackQueryHandler(lambda u, c: handle_new_join(u, c, "doi"), pattern="^doi_join$"))
+    app.add_handler(CallbackQueryHandler(lambda u, c: handle_new_join(u, c, "doan"), pattern="^doan_join$"))
+    app.add_handler(CommandHandler("join", on_join_cmd))
+    app.add_handler(CommandHandler("addqa", addqa))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
-    return app
+    # chạy webhook server của PTB (aiohttp) – Render sẽ detect cổng $PORT
+    port = int(os.environ.get("PORT", "8000"))
+    app.run_webhook(
+        listen="0.0.0.0",
+        port=port,
+        url_path=BOT_TOKEN,                       # path bảo mật
+        webhook_url=f"{WEBHOOK_URL}/{BOT_TOKEN}", # Telegram sẽ gọi vào đây
+        drop_pending_updates=True,
+    )
 
-# ============ cho Render/FastAPI gọi ============
-async def initialize(): pass
-async def start_polling(): 
-    app = build_app()
-    await app.initialize(); await app.start(); await app.updater.start_polling()
-async def stop(): pass
+if __name__ == "__main__":
+    main()
