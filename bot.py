@@ -32,6 +32,21 @@ GIST_TOKEN  = os.getenv("GIST_TOKEN", "").strip()
 # Wiktionary API (VN)
 WIKI_API = "https://vi.wiktionary.org/w/api.php"
 
+# --- bắt đầu khối thay thế ---
+def _normkey(s: str) -> str:
+    s = normalize_spaces(s).lower()
+    return unidecode(s)
+
+def _wiki_title_exists(api_base: str, title: str) -> bool:
+    ...
+def _wiki_search_hit(api_base: str, query: str) -> bool:
+    ...
+def online_has_meaning(phrase: str) -> bool:
+    ...
+def is_valid_phrase(phrase: str) -> bool:
+    ...
+# --- kết thúc khối thay thế ---
+
 # Câu nhắc
 NAGS = [
     "⏳ Vẫn chưa có câu à? Mạnh dạn lên!",
