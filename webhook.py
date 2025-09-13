@@ -1,24 +1,22 @@
 # webhook.py
 from fastapi import FastAPI, Request
 from telegram import Update
-from bot import build_app
+from bot import build_app, initialize, stop
 
 app = FastAPI()
 tg_app = build_app()
 
 @app.on_event("startup")
-async def startup():
+async def _startup():
     await tg_app.initialize()
+    await initialize()
     await tg_app.start()
 
 @app.on_event("shutdown")
-async def shutdown():
+async def _shutdown():
+    await stop()
     await tg_app.stop()
     await tg_app.shutdown()
-
-@app.get("/")
-async def root():
-    return {"status": "ok"}
 
 @app.post("/telegram/webhook")
 async def telegram_webhook(request: Request):
@@ -26,3 +24,7 @@ async def telegram_webhook(request: Request):
     update = Update.de_json(data, tg_app.bot)
     await tg_app.process_update(update)
     return {"ok": True}
+
+@app.get("/")
+async def root():
+    return {"status": "ok"}
