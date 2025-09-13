@@ -1,7 +1,12 @@
 python-telegram-bot[job-queue,rate-limiter]==21.4
 fastapi==0.115.0
 uvicorn==0.30.6
-requests==2.32.3
+
+# HTTP & parse để tra từ online (Soha)
+aiohttp==3.9.5
 beautifulsoup4==4.12.3
-lxml==5.2.2
+lxml==4.9.4
+
+# Tiện ích
 Unidecode==1.3.8
+cachetools==5.3.3
