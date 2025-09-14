@@ -1,7 +1,5 @@
-python-telegram-bot==13.15
-fastapi==0.110.0
-uvicorn==0.29.0
+python-telegram-bot==20.8
 httpx==0.26.0
-requests==2.31.0
+fastapi==0.112.2
+uvicorn==0.30.6
 beautifulsoup4==4.12.3
-imghdr-pure
