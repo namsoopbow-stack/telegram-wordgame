@@ -407,24 +407,27 @@ async def handle_text_doan_chu(update: Update, context: ContextTypes.DEFAULT_TYP
 
 # ===================== WIRING BOT =====================
 def build_bot() -> Application:
-    appb = ApplicationBuilder().token(BOT_TOKEN).concurrent_updates(True).build()
+    appb = (
+        ApplicationBuilder()
+        .token(BOT_TOKEN)
+        .updater(None)   # chặn Updater cũ để tránh lỗi AttributeError
+    )
 
-    # lệnh
-    appb.add_handler(CommandHandler("start", cmd_start))
+    # ======== lệnh ========
+    appb.add_handler(CommandHandler("start", start))
 
-    # menu
-    appb.add_handler(CallbackQueryHandler(on_menu_click, pattern=r"^game:(doi|doan)$"))
-    appb.add_handler(CallbackQueryHandler(on_join_or_start, pattern=r"^(join|start):(doi|doan)$"))
+    # ======== menu ========
+    appb.add_handler(CallbackQueryHandler(menu_handler))
+    appb.add_handler(CallbackQueryHandler(other_menu_handler))
 
-    # text router cho 2 game
-    appb.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_doi_chu))
-    appb.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_doan_chu))
+    # ======== text router cho 2 game ========
+    appb.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router_1))
+    appb.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router_2))
 
-    # job: lobby checker 5s
-    appb.job_queue.run_repeating(periodic_lobby_checker, interval=5, first=5)
+    # ======== job: lobby checker 5s ========
+    appb.job_queue.run_repeating(periodic_check, interval=5)
 
     return appb
-
 # ===================== FASTAPI LIFECYCLE =====================
 @app.on_event("startup")
 async def on_startup():
