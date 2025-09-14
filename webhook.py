@@ -416,35 +416,53 @@ async def handle_text_doan_chu(update: Update, context: ContextTypes.DEFAULT_TYP
 
 # ===================== WIRING BOT =====================
 
+# ======================== WIRING BOT (PTB v20+) ========================
+
 from telegram.ext import (
     Application, ApplicationBuilder, CommandHandler,
     MessageHandler, CallbackQueryHandler, ContextTypes, filters
 )
 
+# --- Các handler TỐI THIỂU cần có ---
+async def start(update: "Update", context: ContextTypes.DEFAULT_TYPE):
+    """/start – chào người dùng hoặc hiển thị menu chính."""
+    name = update.effective_user.first_name if update.effective_user else "bạn"
+    await update.effective_message.reply_text(f"Xin chào {name}! Bot đã sẵn sàng 🎮")
+
+async def help_cmd(update: "Update", context: ContextTypes.DEFAULT_TYPE):
+    await update.effective_message.reply_text("Gõ /start để bắt đầu, gửi chữ để chơi.")
+
+# (Nếu bạn đã có các handler dưới đây trong file, giữ nguyên tên cũ và BỎ 2 dòng add_handler tương ứng)
+# async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE): ...
+# async def other_menu(update: Update, context: ContextTypes.DEFAULT_TYPE): ...
+# async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE): ...
+# async def lobby_checker(context: ContextTypes.DEFAULT_TYPE): ...
+
 def build_bot() -> Application:
-    # Tạo Application (không dùng Updater cũ khi chạy webhook)
+    # Tạo Application. DÙNG .updater(None) nếu chạy bằng webhook/FastAPI (không polling)
     application = (
         ApplicationBuilder()
         .token(BOT_TOKEN)
-        .updater(None)          # quan trọng: tránh Updater cũ gây lỗi
-        .build()                # <<< THÊM build() để có Application
+        .updater(None)
+        .build()
     )
 
     # ======= lệnh =======
     application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("help", help_cmd))
 
-    # ======= menu/callback =======
-    application.add_handler(CallbackQueryHandler(menu_callback, pattern=r"^menu:"))
-    application.add_handler(CallbackQueryHandler(other_callback, pattern=r"^other:"))
+    # ======= menu (nếu có) =======
+    # application.add_handler(CallbackQueryHandler(menu, pattern="^menu$"))
+    # application.add_handler(CallbackQueryHandler(other_menu, pattern="^other$"))
 
-    # ======= router text cho 2 game =======
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, route_text))
-    application.add_handler(MessageHandler(filters.COMMAND, unknown_command))
+    # ======= text router cho game (nếu có) =======
+    # application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
 
-    # ======= job: kiểm tra lobby mỗi 5s =======
-    application.job_queue.run_repeating(periodic_check, interval=5, first=5)
+    # ======= job: lobby checker 5s (nếu có) =======
+    # application.job_queue.run_repeating(lobby_checker, interval=5, first=5)
 
     return application
+# ====================== HẾT WIRING BOT ======================
 # ===================== FASTAPI LIFECYCLE =====================
 @app.on_event("startup")
 async def on_startup():
