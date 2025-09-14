@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: wordgame-bot
+    runtime: python
+    plan: free
+    buildCommand: ""
+    startCommand: uvicorn webhook:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.6
