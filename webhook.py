@@ -15,6 +15,15 @@ import os
 import json
 import time
 import asyncio
+from telegram.ext import (
+    Application,
+    ApplicationBuilder,
+    ContextTypes,
+    CommandHandler,
+    CallbackQueryHandler,
+    MessageHandler,
+    filters,
+)
 from typing import Dict, List, Optional, Tuple
 
 import httpx
@@ -406,28 +415,36 @@ async def handle_text_doan_chu(update: Update, context: ContextTypes.DEFAULT_TYP
         del GAMES[chat_id]
 
 # ===================== WIRING BOT =====================
+
+from telegram.ext import (
+    Application, ApplicationBuilder, CommandHandler,
+    MessageHandler, CallbackQueryHandler, ContextTypes, filters
+)
+
 def build_bot() -> Application:
-    appb = (
+    # Tạo Application (không dùng Updater cũ khi chạy webhook)
+    application = (
         ApplicationBuilder()
         .token(BOT_TOKEN)
-        .updater(None)   # chặn Updater cũ để tránh lỗi AttributeError
+        .updater(None)          # quan trọng: tránh Updater cũ gây lỗi
+        .build()                # <<< THÊM build() để có Application
     )
 
-    # ======== lệnh ========
-    appb.add_handler(CommandHandler("start", start))
+    # ======= lệnh =======
+    application.add_handler(CommandHandler("start", start))
 
-    # ======== menu ========
-    appb.add_handler(CallbackQueryHandler(menu_handler))
-    appb.add_handler(CallbackQueryHandler(other_menu_handler))
+    # ======= menu/callback =======
+    application.add_handler(CallbackQueryHandler(menu_callback, pattern=r"^menu:"))
+    application.add_handler(CallbackQueryHandler(other_callback, pattern=r"^other:"))
 
-    # ======== text router cho 2 game ========
-    appb.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router_1))
-    appb.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router_2))
+    # ======= router text cho 2 game =======
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, route_text))
+    application.add_handler(MessageHandler(filters.COMMAND, unknown_command))
 
-    # ======== job: lobby checker 5s ========
-    appb.job_queue.run_repeating(periodic_check, interval=5)
+    # ======= job: kiểm tra lobby mỗi 5s =======
+    application.job_queue.run_repeating(periodic_check, interval=5, first=5)
 
-    return appb
+    return application
 # ===================== FASTAPI LIFECYCLE =====================
 @app.on_event("startup")
 async def on_startup():
